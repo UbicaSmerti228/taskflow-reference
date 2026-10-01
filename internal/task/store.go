@@ -19,7 +19,7 @@ type FileStore struct {
 	path string
 	now  func() time.Time
 
-	mu sync.Mutex // HTTP-сервер вызывает методы из разных горутин
+	mu sync.Mutex // HTTP-сервер и воркер вызывают методы из разных горутин
 }
 
 // NewFileStore возвращает хранилище в файле path. Файл создаётся при первой записи.
@@ -27,59 +27,174 @@ func NewFileStore(path string) *FileStore {
 	return &FileStore{path: path, now: time.Now}
 }
 
-// Add создаёт задачу с заголовком title.
-func (s *FileStore) Add(title string) (Task, error) {
-	title = strings.TrimSpace(title)
+// Create создаёт задачу.
+func (s *FileStore) Create(in NewTask) (Task, error) {
+	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		return Task{}, ErrEmptyTitle
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	tasks, err := s.load()
+	var created Task
+	err := s.change(func(tasks []Task) ([]Task, error) {
+		created = Task{ID: nextID(tasks), Title: title, DueAt: in.DueAt, CreatedAt: s.now().UTC()}
+		return append(tasks, created), nil
+	})
 	if err != nil {
-		return Task{}, fmt.Errorf("add task: %w", err)
+		return Task{}, fmt.Errorf("create task: %w", err)
 	}
-	t := Task{ID: nextID(tasks), Title: title, CreatedAt: s.now().UTC()}
-	if err := s.save(append(tasks, t)); err != nil {
-		return Task{}, fmt.Errorf("add task: %w", err)
-	}
-	return t, nil
+	return created, nil
 }
 
-// List возвращает все задачи в порядке создания.
-func (s *FileStore) List() ([]Task, error) {
+// Get возвращает задачу по id или ErrNotFound.
+func (s *FileStore) Get(id int) (Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tasks, err := s.load()
 	if err != nil {
-		return nil, fmt.Errorf("list tasks: %w", err)
+		return Task{}, fmt.Errorf("get task %d: %w", id, err)
 	}
-	return tasks, nil
+	for _, t := range tasks {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	return Task{}, fmt.Errorf("get task %d: %w", id, ErrNotFound)
 }
 
-// Done отмечает задачу выполненной. Для неизвестного id возвращает ErrNotFound.
-func (s *FileStore) Done(id int) (Task, error) {
+// List возвращает страницу задач в порядке создания и общее число задач, подходящих под фильтр.
+func (s *FileStore) List(f Filter) ([]Task, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tasks, err := s.load()
 	if err != nil {
-		return Task{}, fmt.Errorf("done task %d: %w", id, err)
+		return nil, 0, fmt.Errorf("list tasks: %w", err)
 	}
-	for i := range tasks {
-		if tasks[i].ID != id {
-			continue
+
+	matched := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if f.Done == nil || t.Done == *f.Done {
+			matched = append(matched, t)
 		}
-		tasks[i].Done = true
-		if err := s.save(tasks); err != nil {
-			return Task{}, fmt.Errorf("done task %d: %w", id, err)
-		}
-		return tasks[i], nil
 	}
-	return Task{}, fmt.Errorf("done task %d: %w", id, ErrNotFound)
+	total := len(matched)
+
+	start := min(max(f.Offset, 0), total)
+	end := total
+	if f.Limit > 0 {
+		end = min(start+f.Limit, total)
+	}
+	return matched[start:end], total, nil
+}
+
+// Update применяет патч к задаче. Новый срок сбрасывает отметку о напоминании.
+func (s *FileStore) Update(id int, p Patch) (Task, error) {
+	if p.Empty() {
+		return Task{}, ErrEmptyPatch
+	}
+	if p.Title != nil {
+		title := strings.TrimSpace(*p.Title)
+		if title == "" {
+			return Task{}, ErrEmptyTitle
+		}
+		p.Title = &title
+	}
+
+	var updated Task
+	err := s.change(func(tasks []Task) ([]Task, error) {
+		for i := range tasks {
+			if tasks[i].ID != id {
+				continue
+			}
+			if p.Title != nil {
+				tasks[i].Title = *p.Title
+			}
+			if p.Done != nil {
+				tasks[i].Done = *p.Done
+			}
+			if p.DueAt != nil {
+				tasks[i].DueAt = p.DueAt
+				tasks[i].RemindedAt = nil
+			}
+			updated = tasks[i]
+			return tasks, nil
+		}
+		return nil, ErrNotFound
+	})
+	if err != nil {
+		return Task{}, fmt.Errorf("update task %d: %w", id, err)
+	}
+	return updated, nil
+}
+
+// Delete удаляет задачу. Для неизвестного id возвращает ErrNotFound.
+func (s *FileStore) Delete(id int) error {
+	err := s.change(func(tasks []Task) ([]Task, error) {
+		for i := range tasks {
+			if tasks[i].ID == id {
+				return append(tasks[:i], tasks[i+1:]...), nil
+			}
+		}
+		return nil, ErrNotFound
+	})
+	if err != nil {
+		return fmt.Errorf("delete task %d: %w", id, err)
+	}
+	return nil
+}
+
+// DueForReminder возвращает невыполненные задачи, срок которых наступил, а напоминание ещё не отправлено.
+func (s *FileStore) DueForReminder(now time.Time) ([]Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tasks, err := s.load()
+	if err != nil {
+		return nil, fmt.Errorf("due tasks: %w", err)
+	}
+	var due []Task
+	for _, t := range tasks {
+		if !t.Done && t.RemindedAt == nil && t.DueAt != nil && !t.DueAt.After(now) {
+			due = append(due, t)
+		}
+	}
+	return due, nil
+}
+
+// MarkReminded запоминает, что напоминание по задаче отправлено.
+func (s *FileStore) MarkReminded(id int, at time.Time) error {
+	err := s.change(func(tasks []Task) ([]Task, error) {
+		for i := range tasks {
+			if tasks[i].ID == id {
+				at = at.UTC()
+				tasks[i].RemindedAt = &at
+				return tasks, nil
+			}
+		}
+		return nil, ErrNotFound
+	})
+	if err != nil {
+		return fmt.Errorf("mark task %d reminded: %w", id, err)
+	}
+	return nil
+}
+
+// change читает задачи, даёт функции их изменить и сохраняет результат.
+// Всё под одним захватом мьютекса: между чтением и записью никто не вклинится.
+func (s *FileStore) change(fn func([]Task) ([]Task, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tasks, err := s.load()
+	if err != nil {
+		return err
+	}
+	tasks, err = fn(tasks)
+	if err != nil {
+		return err
+	}
+	return s.save(tasks)
 }
 
 func nextID(tasks []Task) int {

@@ -1,0 +1,244 @@
+openapi: 3.0.3
+info:
+  title: TaskFlow API
+  version: 0.2.0
+  description: Трекер задач. Все ошибки приходят в одном формате, см. схему Error.
+servers:
+  - url: http://localhost:8080
+paths:
+  /tasks:
+    get:
+      summary: Список задач
+      operationId: listTasks
+      parameters:
+        - name: limit
+          in: query
+          description: Сколько задач вернуть
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          description: Сколько задач пропустить
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: done
+          in: query
+          description: Оставить только выполненные (true) или только невыполненные (false)
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Страница задач в порядке создания
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskList"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "500":
+          $ref: "#/components/responses/Internal"
+    post:
+      summary: Создать задачу
+      operationId: createTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewTask"
+      responses:
+        "201":
+          description: Задача создана
+          headers:
+            Location:
+              description: Адрес созданной задачи
+              schema:
+                type: string
+                example: /tasks/1
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+  /tasks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+    get:
+      summary: Получить задачу
+      operationId: getTask
+      responses:
+        "200":
+          description: Задача
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/Internal"
+    patch:
+      summary: Изменить часть полей задачи
+      operationId: updateTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskPatch"
+      responses:
+        "200":
+          description: Задача после изменения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "413":
+          $ref: "#/components/responses/TooLarge"
+        "500":
+          $ref: "#/components/responses/Internal"
+    delete:
+      summary: Удалить задачу
+      operationId: deleteTask
+      responses:
+        "204":
+          description: Задача удалена
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/Internal"
+components:
+  schemas:
+    Task:
+      type: object
+      required: [id, title, done, created_at]
+      properties:
+        id:
+          type: integer
+          example: 1
+        title:
+          type: string
+          example: купить молоко
+        done:
+          type: boolean
+        due_at:
+          type: string
+          format: date-time
+          description: Срок. Когда он наступит, воркер отправит напоминание.
+        reminded_at:
+          type: string
+          format: date-time
+          description: Когда отправлено напоминание
+        created_at:
+          type: string
+          format: date-time
+    NewTask:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+        due_at:
+          type: string
+          format: date-time
+    TaskPatch:
+      type: object
+      description: Нужно передать хотя бы одно поле.
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+        done:
+          type: boolean
+        due_at:
+          type: string
+          format: date-time
+          description: Новый срок сбрасывает отметку о напоминании.
+    TaskList:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+        total:
+          type: integer
+          description: Сколько задач подходит под фильтр
+        limit:
+          type: integer
+        offset:
+          type: integer
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [invalid_argument, not_found, method_not_allowed, too_large, internal]
+            message:
+              type: string
+  responses:
+    InvalidArgument:
+      description: Неверный запрос
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: invalid_argument
+              message: title is required
+    NotFound:
+      description: Задачи с таким id нет
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: not_found
+              message: task not found
+    TooLarge:
+      description: Тело запроса больше 1 МБ
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Internal:
+      description: Внутренняя ошибка. Подробности остаются в логе сервера.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
