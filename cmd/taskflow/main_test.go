@@ -7,18 +7,39 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/tasktest"
 )
 
-func TestRun(t *testing.T) {
-	store := task.NewFileStore(filepath.Join(t.TempDir(), "tasks.json"))
+// testApp собирает приложение на хранилище в памяти и считает обращения к зависимостям.
+type testApp struct {
+	*app
+	store      *tasktest.MemStore
+	migrations int
+	closed     int
+}
 
-	// Шаги идут по порядку и работают с одним файлом.
+func newTestApp(out io.Writer) *testApp {
+	ta := &testApp{store: tasktest.NewMemStore()}
+	ta.app = &app{
+		out:     out,
+		migrate: func(context.Context) error { ta.migrations++; return nil },
+		open: func(context.Context) (store, func(), error) {
+			return ta.store, func() { ta.closed++ }, nil
+		},
+	}
+	return ta
+}
+
+func TestRun(t *testing.T) {
+	var out strings.Builder
+	ta := newTestApp(&out)
+
+	// Шаги идут по порядку и работают с одним хранилищем.
 	steps := []struct {
 		name      string
 		args      []string
@@ -31,6 +52,7 @@ func TestRun(t *testing.T) {
 		{name: "список", args: []string{"list"}, wantOut: "[ ] 1  купить молоко"},
 		{name: "выполнение", args: []string{"done", "1"}, wantOut: "Выполнена задача 1"},
 		{name: "список после выполнения", args: []string{"list"}, wantOut: "[x] 1  купить молоко"},
+		{name: "миграции", args: []string{"migrate"}, wantOut: "Миграции применены"},
 		{name: "неизвестный id", args: []string{"done", "7"}, wantErr: "задачи с id 7 нет"},
 		{name: "id не число", args: []string{"done", "abc"}, wantErr: "id должен быть числом", wantUsage: true},
 		{name: "done без id", args: []string{"done"}, wantErr: "укажи id", wantUsage: true},
@@ -41,8 +63,8 @@ func TestRun(t *testing.T) {
 	}
 	for _, st := range steps {
 		t.Run(st.name, func(t *testing.T) {
-			var out strings.Builder
-			err := run(context.Background(), st.args, store, &out)
+			out.Reset()
+			err := ta.run(context.Background(), st.args)
 
 			if st.wantErr == "" {
 				if err != nil {
@@ -61,22 +83,78 @@ func TestRun(t *testing.T) {
 			}
 		})
 	}
+	if ta.migrations != 1 {
+		t.Errorf("миграции запускались %d раз, want 1: только по команде migrate", ta.migrations)
+	}
+}
+
+func TestRunStoreErrors(t *testing.T) {
+	boom := errors.New("база недоступна")
+
+	t.Run("хранилище не открылось", func(t *testing.T) {
+		ta := newTestApp(io.Discard)
+		ta.open = func(context.Context) (store, func(), error) { return nil, nil, boom }
+		for _, args := range [][]string{{"add", "a"}, {"list"}, {"done", "1"}} {
+			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
+				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
+			}
+		}
+	})
+
+	t.Run("запрос упал, соединения закрыты", func(t *testing.T) {
+		ta := newTestApp(io.Discard)
+		ta.store.Err = boom
+		for _, args := range [][]string{{"add", "a"}, {"list"}, {"done", "1"}} {
+			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
+				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
+			}
+		}
+		if ta.closed != 3 {
+			t.Errorf("хранилище закрыто %d раз, want 3", ta.closed)
+		}
+	})
+
+	t.Run("миграции упали — сервер не стартует", func(t *testing.T) {
+		ta := newTestApp(io.Discard)
+		ta.migrate = func(context.Context) error { return boom }
+		opened := false
+		ta.open = func(context.Context) (store, func(), error) { opened = true; return ta.store, func() {}, nil }
+
+		for _, args := range [][]string{{"migrate"}, {"serve", "-addr", "127.0.0.1:0"}} {
+			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
+				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
+			}
+		}
+		if opened {
+			t.Error("хранилище открыто, хотя миграции упали")
+		}
+	})
+}
+
+func TestNewAppRequiresDatabaseURL(t *testing.T) {
+	a := newApp("", io.Discard)
+	for _, args := range [][]string{{"list"}, {"migrate"}, {"serve"}} {
+		err := a.run(context.Background(), args)
+		if !errors.Is(err, errUsage) || !strings.Contains(err.Error(), "DATABASE_URL") {
+			t.Errorf("run(%v) без DATABASE_URL: error = %v, want подсказку про DATABASE_URL", args, err)
+		}
+	}
 }
 
 func TestServe(t *testing.T) {
-	store := task.NewFileStore(filepath.Join(t.TempDir(), "tasks.json"))
+	pr, pw := io.Pipe()
+	ta := newTestApp(pw)
 	past := time.Now().Add(-time.Minute)
-	if _, err := store.Create(task.NewTask{Title: "просрочена", DueAt: &past}); err != nil {
+	if _, err := ta.store.Create(context.Background(), task.NewTask{Title: "просрочена", DueAt: &past}); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
 		// Порт 0 — система сама выберет свободный, адрес узнаём из вывода.
-		done <- run(ctx, []string{"serve", "-addr", "127.0.0.1:0", "-remind-interval", "5ms"}, store, pw)
+		done <- ta.run(ctx, []string{"serve", "-addr", "127.0.0.1:0", "-remind-interval", "5ms"})
 		pw.Close() //nolint:errcheck // у PipeWriter Close всегда возвращает nil
 	}()
 
@@ -98,7 +176,7 @@ func TestServe(t *testing.T) {
 	// Воркер напоминаний работает рядом с сервером.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		got, err := store.Get(1)
+		got, err := ta.store.Get(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,6 +199,9 @@ func TestServe(t *testing.T) {
 	if _, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
 		t.Error("после остановки порт всё ещё принимает соединения")
 	}
+	if ta.migrations != 1 || ta.closed != 1 {
+		t.Errorf("миграции: %d, закрытий хранилища: %d; want 1 и 1", ta.migrations, ta.closed)
+	}
 }
 
 func TestServeBusyPort(t *testing.T) {
@@ -130,8 +211,7 @@ func TestServeBusyPort(t *testing.T) {
 	}
 	defer ln.Close() //nolint:errcheck // тест завершается
 
-	store := task.NewFileStore(filepath.Join(t.TempDir(), "tasks.json"))
-	err = run(context.Background(), []string{"serve", "-addr", ln.Addr().String()}, store, io.Discard)
+	err = newTestApp(io.Discard).run(context.Background(), []string{"serve", "-addr", ln.Addr().String()})
 	if err == nil || !strings.Contains(err.Error(), "listen") {
 		t.Errorf("serve на занятом порту вернул %v, want ошибку listen", err)
 	}

@@ -15,20 +15,20 @@ import (
 type fakeStore struct {
 	mu       sync.Mutex
 	tasks    []task.Task
-	reminded map[int]int // id → сколько раз поставлена отметка
+	reminded map[int64]int // id → сколько раз поставлена отметка
 	err      error
 }
 
 func newFakeStore(n int) *fakeStore {
-	s := &fakeStore{reminded: map[int]int{}}
+	s := &fakeStore{reminded: map[int64]int{}}
 	due := time.Now().Add(-time.Minute)
-	for id := 1; id <= n; id++ {
+	for id := int64(1); id <= int64(n); id++ {
 		s.tasks = append(s.tasks, task.Task{ID: id, Title: "задача", DueAt: &due})
 	}
 	return s
 }
 
-func (s *fakeStore) DueForReminder(time.Time) ([]task.Task, error) {
+func (s *fakeStore) DueForReminder(context.Context, time.Time) ([]task.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err != nil {
@@ -43,7 +43,7 @@ func (s *fakeStore) DueForReminder(time.Time) ([]task.Task, error) {
 	return due, nil
 }
 
-func (s *fakeStore) MarkReminded(id int, _ time.Time) error {
+func (s *fakeStore) MarkReminded(_ context.Context, id int64, _ time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reminded[id]++

@@ -1,14 +1,15 @@
-// Package task хранит задачи и правила работы с ними.
+// Package task описывает задачу и правила, общие для всех хранилищ.
 package task
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
 // Task — одна задача трекера.
 type Task struct {
-	ID         int        `json:"id"`
+	ID         int64      `json:"id"`
 	Title      string     `json:"title"`
 	Done       bool       `json:"done"`
 	DueAt      *time.Time `json:"due_at,omitempty"`      // срок; nil — срока нет
@@ -29,16 +30,12 @@ type Patch struct {
 	DueAt *time.Time
 }
 
-// Empty сообщает, что в патче нет ни одного поля.
-func (p Patch) Empty() bool {
-	return p.Title == nil && p.Done == nil && p.DueAt == nil
-}
-
-// Filter — условия выборки списка. Limit 0 означает «без ограничения».
+// Filter — условия выборки списка.
 type Filter struct {
-	Done   *bool
-	Limit  int
-	Offset int
+	Done    *bool
+	Limit   int   // 0 — без ограничения
+	Offset  int   // пропустить столько задач
+	AfterID int64 // вернуть задачи с id больше этого: пагинация по ключу
 }
 
 // Ошибки, по которым вызывающий код выбирает, что ответить пользователю.
@@ -47,3 +44,27 @@ var (
 	ErrEmptyTitle = errors.New("title is empty")
 	ErrEmptyPatch = errors.New("nothing to update")
 )
+
+// Normalize проверяет данные новой задачи и обрезает пробелы в заголовке.
+func (n NewTask) Normalize() (NewTask, error) {
+	n.Title = strings.TrimSpace(n.Title)
+	if n.Title == "" {
+		return NewTask{}, ErrEmptyTitle
+	}
+	return n, nil
+}
+
+// Normalize проверяет патч и обрезает пробелы в заголовке.
+func (p Patch) Normalize() (Patch, error) {
+	if p.Title == nil && p.Done == nil && p.DueAt == nil {
+		return Patch{}, ErrEmptyPatch
+	}
+	if p.Title != nil {
+		title := strings.TrimSpace(*p.Title)
+		if title == "" {
+			return Patch{}, ErrEmptyTitle
+		}
+		p.Title = &title
+	}
+	return p, nil
+}

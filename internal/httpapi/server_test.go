@@ -1,24 +1,25 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/tasktest"
 )
 
-// newAPI поднимает обработчик на настоящем файловом хранилище во временной папке.
+// newAPI поднимает обработчик на хранилище в памяти: тесты HTTP-слоя не требуют базы.
 func newAPI(t *testing.T, titles ...string) http.Handler {
 	t.Helper()
-	store := task.NewFileStore(filepath.Join(t.TempDir(), "tasks.json"))
+	store := tasktest.NewMemStore()
 	for _, title := range titles {
-		if _, err := store.Create(task.NewTask{Title: title}); err != nil {
+		if _, err := store.Create(context.Background(), task.NewTask{Title: title}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -81,6 +82,7 @@ func TestErrors(t *testing.T) {
 		{name: "limit больше максимума", method: "GET", path: "/tasks?limit=101", want: 400, wantCode: "invalid_argument"},
 		{name: "отрицательный offset", method: "GET", path: "/tasks?offset=-1", want: 400, wantCode: "invalid_argument"},
 		{name: "done не булево", method: "GET", path: "/tasks?done=maybe", want: 400, wantCode: "invalid_argument"},
+		{name: "after_id не число", method: "GET", path: "/tasks?after_id=x", want: 400, wantCode: "invalid_argument"},
 		{name: "метод не поддерживается для списка", method: "PUT", path: "/tasks", want: 405, wantCode: "method_not_allowed"},
 		{name: "метод не поддерживается для задачи", method: "POST", path: "/tasks/1", want: 405, wantCode: "method_not_allowed"},
 		{name: "неизвестный путь", method: "GET", path: "/users", want: 404, wantCode: "not_found"},
@@ -119,7 +121,7 @@ func TestList(t *testing.T) {
 	tests := []struct {
 		name       string
 		query      string
-		wantFirst  int
+		wantFirst  int64
 		wantLen    int
 		wantTotal  int
 		wantLimit  int
@@ -182,19 +184,10 @@ func TestGetPatchDelete(t *testing.T) {
 	}
 }
 
-// brokenStore всегда возвращает внутреннюю ошибку.
-type brokenStore struct{}
-
-var errDisk = errors.New("disk /var/data is full")
-
-func (brokenStore) Create(task.NewTask) (task.Task, error)     { return task.Task{}, errDisk }
-func (brokenStore) Get(int) (task.Task, error)                 { return task.Task{}, errDisk }
-func (brokenStore) List(task.Filter) ([]task.Task, int, error) { return nil, 0, errDisk }
-func (brokenStore) Update(int, task.Patch) (task.Task, error)  { return task.Task{}, errDisk }
-func (brokenStore) Delete(int) error                           { return errDisk }
-
 func TestInternalErrorIsHidden(t *testing.T) {
-	h := New(brokenStore{})
+	store := tasktest.NewMemStore()
+	store.Err = errors.New("disk /var/data is full")
+	h := New(store)
 	requests := []struct{ method, path, body string }{
 		{"GET", "/tasks", ""},
 		{"POST", "/tasks", `{"title":"задача"}`},
@@ -213,5 +206,30 @@ func TestInternalErrorIsHidden(t *testing.T) {
 		if strings.Contains(rec.Body.String(), "disk") {
 			t.Errorf("%s %s: внутренняя ошибка попала в ответ: %s", req.method, req.path, rec.Body)
 		}
+	}
+}
+
+func TestKeysetPagination(t *testing.T) {
+	titles := make([]string, 5)
+	for i := range titles {
+		titles[i] = fmt.Sprintf("задача %d", i+1)
+	}
+	h := newAPI(t, titles...)
+
+	// Листаем по курсору, пока он приходит: 2 + 2 + 1 задачи.
+	var seen []int64
+	path := "/tasks?limit=2"
+	for range 10 {
+		got := decodeBody[listResponse](t, do(t, h, http.MethodGet, path, ""))
+		for _, tk := range got.Items {
+			seen = append(seen, tk.ID)
+		}
+		if got.NextAfterID == 0 {
+			break
+		}
+		path = fmt.Sprintf("/tasks?limit=2&after_id=%d", got.NextAfterID)
+	}
+	if fmt.Sprint(seen) != "[1 2 3 4 5]" {
+		t.Errorf("по курсору получены задачи %v, want [1 2 3 4 5] без дублей и пропусков", seen)
 	}
 }

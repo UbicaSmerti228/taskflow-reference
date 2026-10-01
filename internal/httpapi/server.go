@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,11 +23,11 @@ const (
 // Store — то, что серверу нужно от хранилища.
 // Интерфейс объявлен здесь, у потребителя: в тестах его легко подменить.
 type Store interface {
-	Create(in task.NewTask) (task.Task, error)
-	Get(id int) (task.Task, error)
-	List(f task.Filter) ([]task.Task, int, error)
-	Update(id int, p task.Patch) (task.Task, error)
-	Delete(id int) error
+	Create(ctx context.Context, in task.NewTask) (task.Task, error)
+	Get(ctx context.Context, id int64) (task.Task, error)
+	List(ctx context.Context, f task.Filter) ([]task.Task, int, error)
+	Update(ctx context.Context, id int64, p task.Patch) (task.Task, error)
+	Delete(ctx context.Context, id int64) error
 }
 
 type server struct {
@@ -60,6 +61,8 @@ type listResponse struct {
 	Total  int         `json:"total"`
 	Limit  int         `json:"limit"`
 	Offset int         `json:"offset"`
+	// NextAfterID — курсор следующей страницы: передай его в after_id. Его нет, если страница неполная.
+	NextAfterID int64 `json:"next_after_id,omitempty"`
 }
 
 func (s *server) list(w http.ResponseWriter, r *http.Request) {
@@ -82,6 +85,14 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Offset = n
 	}
+	if v := q.Get("after_id"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_argument", "after_id must be a non-negative number")
+			return
+		}
+		f.AfterID = n
+	}
 	if v := q.Get("done"); v != "" {
 		done, err := strconv.ParseBool(v)
 		if err != nil {
@@ -91,12 +102,16 @@ func (s *server) list(w http.ResponseWriter, r *http.Request) {
 		f.Done = &done
 	}
 
-	tasks, total, err := s.store.List(f)
+	tasks, total, err := s.store.List(r.Context(), f)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, listResponse{Items: tasks, Total: total, Limit: f.Limit, Offset: f.Offset})
+	resp := listResponse{Items: tasks, Total: total, Limit: f.Limit, Offset: f.Offset}
+	if len(tasks) == f.Limit {
+		resp.NextAfterID = tasks[len(tasks)-1].ID
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) create(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +122,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	t, err := s.store.Create(task.NewTask{Title: in.Title, DueAt: in.DueAt})
+	t, err := s.store.Create(r.Context(), task.NewTask{Title: in.Title, DueAt: in.DueAt})
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -121,7 +136,7 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	t, err := s.store.Get(id)
+	t, err := s.store.Get(r.Context(), id)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -142,7 +157,7 @@ func (s *server) update(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	t, err := s.store.Update(id, task.Patch{Title: in.Title, Done: in.Done, DueAt: in.DueAt})
+	t, err := s.store.Update(r.Context(), id, task.Patch{Title: in.Title, Done: in.Done, DueAt: in.DueAt})
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -155,7 +170,7 @@ func (s *server) delete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.Delete(id); err != nil {
+	if err := s.store.Delete(r.Context(), id); err != nil {
 		s.fail(w, err)
 		return
 	}
@@ -185,8 +200,8 @@ func methodNotAllowed(allow string) http.HandlerFunc {
 	}
 }
 
-func pathID(w http.ResponseWriter, r *http.Request) (int, bool) {
-	id, err := strconv.Atoi(r.PathValue("id"))
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || id < 1 {
 		writeError(w, http.StatusBadRequest, "invalid_argument", "id must be a positive number")
 		return 0, false

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: TaskFlow API
-  version: 0.2.0
+  version: 0.3.0
   description: Трекер задач. Все ошибки приходят в одном формате, см. схему Error.
 servers:
   - url: http://localhost:8080
@@ -21,11 +21,18 @@ paths:
             default: 20
         - name: offset
           in: query
-          description: Сколько задач пропустить
+          description: Сколько задач пропустить. На больших списках листай через after_id, он не замедляется с глубиной.
           schema:
             type: integer
             minimum: 0
             default: 0
+        - name: after_id
+          in: query
+          description: Вернуть задачи с id больше этого. Значение берётся из next_after_id предыдущей страницы.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
         - name: done
           in: query
           description: Оставить только выполненные (true) или только невыполненные (false)
@@ -77,6 +84,7 @@ paths:
         required: true
         schema:
           type: integer
+          format: int64
           minimum: 1
     get:
       summary: Получить задачу
@@ -138,6 +146,7 @@ components:
       properties:
         id:
           type: integer
+          format: int64
           example: 1
         title:
           type: string
@@ -196,6 +205,10 @@ components:
           type: integer
         offset:
           type: integer
+        next_after_id:
+          type: integer
+          format: int64
+          description: Курсор следующей страницы. Отсутствует, если страница неполная.
     Error:
       type: object
       required: [error]

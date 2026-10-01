@@ -16,4 +16,34 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
+      # Без -short: интеграционные тесты сами поднимают PostgreSQL в контейнере.
       - run: go test -race ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - name: Сборка и запуск
+        run: docker compose up -d --build --wait --wait-timeout 120
+      - name: Размер образа меньше 30 МБ
+        run: |
+          size=$(docker image inspect "$(docker compose images -q api)" --format '{{.Size}}')
+          echo "Размер образа: $((size / 1024 / 1024)) МБ"
+          test "$size" -lt $((30 * 1024 * 1024))
+      - name: Проверка API
+        run: |
+          set -eux
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 -X POST -d '{"title":"из CI"}' localhost:8080/tasks
+          curl -fsS localhost:8080/tasks | grep -q '"title":"из CI"'
+      - name: Данные переживают пересоздание контейнеров
+        run: |
+          set -eux
+          docker compose down
+          docker compose up -d --wait --wait-timeout 120
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 localhost:8080/tasks | grep -q '"title":"из CI"'
+      - name: Логи при ошибке
+        if: failure()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v

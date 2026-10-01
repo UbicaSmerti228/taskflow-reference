@@ -12,8 +12,8 @@ import (
 
 // Store — то, что воркеру нужно от хранилища.
 type Store interface {
-	DueForReminder(now time.Time) ([]task.Task, error)
-	MarkReminded(id int, at time.Time) error
+	DueForReminder(ctx context.Context, now time.Time) ([]task.Task, error)
+	MarkReminded(ctx context.Context, id int64, at time.Time) error
 }
 
 // Notifier отправляет одно напоминание. В этой версии оно пишется в лог,
@@ -82,7 +82,7 @@ func (w *Worker) Run(ctx context.Context) {
 // scan раздаёт пулу все просроченные задачи и ждёт, пока пачка обработается.
 // Следующий обход начнётся только после этого, поэтому одна задача не попадёт в работу дважды.
 func (w *Worker) scan(ctx context.Context, jobs chan<- job) {
-	tasks, err := w.store.DueForReminder(w.now())
+	tasks, err := w.store.DueForReminder(ctx, w.now())
 	if err != nil {
 		log.Printf("reminder: %v", err)
 		return
@@ -107,7 +107,8 @@ func (w *Worker) remind(ctx context.Context, t task.Task) {
 		log.Printf("reminder: notify task %d: %v", t.ID, err)
 		return
 	}
-	if err := w.store.MarkReminded(t.ID, w.now()); err != nil {
+	// Отметку ставим даже при остановке сервиса: напоминание уже ушло.
+	if err := w.store.MarkReminded(context.WithoutCancel(ctx), t.ID, w.now()); err != nil {
 		log.Printf("reminder: %v", err)
 	}
 }
