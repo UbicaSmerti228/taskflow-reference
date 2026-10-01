@@ -3,6 +3,8 @@ package reminder
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
+
+var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 // fakeStore отдаёт задачи, пока по ним не поставлена отметка.
 type fakeStore struct {
@@ -116,7 +120,7 @@ func runUntil(t *testing.T, w *Worker, cond func() bool) {
 
 func TestWorkerRemindsEachTaskOnce(t *testing.T) {
 	store, notifier := newFakeStore(20), &fakeNotifier{delay: time.Millisecond}
-	w := New(store, notifier, time.Millisecond, 4)
+	w := New(store, notifier, time.Millisecond, 4, quiet)
 
 	runUntil(t, w, func() bool { return store.remindedCount() == 20 })
 
@@ -135,7 +139,7 @@ func TestWorkerRemindsEachTaskOnce(t *testing.T) {
 
 func TestWorkerLimitsConcurrency(t *testing.T) {
 	store, notifier := newFakeStore(30), &fakeNotifier{delay: 5 * time.Millisecond}
-	w := New(store, notifier, time.Millisecond, 3)
+	w := New(store, notifier, time.Millisecond, 3, quiet)
 
 	runUntil(t, w, func() bool { return store.remindedCount() == 30 })
 
@@ -149,7 +153,7 @@ func TestWorkerLimitsConcurrency(t *testing.T) {
 func TestWorkerRetriesFailedNotification(t *testing.T) {
 	store := newFakeStore(1)
 	notifier := &fakeNotifier{fail: func(call int64) bool { return call <= 2 }} // первые две попытки падают
-	w := New(store, notifier, time.Millisecond, 1)
+	w := New(store, notifier, time.Millisecond, 1, quiet)
 
 	runUntil(t, w, func() bool { return store.remindedCount() == 1 })
 
@@ -160,7 +164,7 @@ func TestWorkerRetriesFailedNotification(t *testing.T) {
 
 func TestWorkerStopsWhileNotifying(t *testing.T) {
 	store, notifier := newFakeStore(10), &fakeNotifier{delay: time.Hour} // уведомление «зависло»
-	w := New(store, notifier, time.Millisecond, 2)
+	w := New(store, notifier, time.Millisecond, 2, quiet)
 
 	runUntil(t, w, func() bool { return notifier.running.Load() == 2 })
 
@@ -172,7 +176,7 @@ func TestWorkerStopsWhileNotifying(t *testing.T) {
 func TestWorkerSurvivesStoreError(t *testing.T) {
 	store, notifier := newFakeStore(1), &fakeNotifier{}
 	store.err = errors.New("файл недоступен")
-	w := New(store, notifier, time.Millisecond, 1)
+	w := New(store, notifier, time.Millisecond, 1, quiet)
 
 	runUntil(t, w, func() bool { return true })
 	if got := notifier.calls.Load(); got != 0 {
@@ -187,7 +191,7 @@ func TestWorkerSurvivesStoreError(t *testing.T) {
 }
 
 func TestNewClampsArguments(t *testing.T) {
-	w := New(newFakeStore(0), &fakeNotifier{}, 0, 0)
+	w := New(newFakeStore(0), &fakeNotifier{}, 0, 0, quiet)
 	if w.workers != 1 || w.interval <= 0 {
 		t.Errorf("New(…, 0, 0): workers = %d, interval = %v; want 1 и положительный интервал", w.workers, w.interval)
 	}
@@ -195,7 +199,7 @@ func TestNewClampsArguments(t *testing.T) {
 
 func TestLogNotifier(t *testing.T) {
 	due := time.Now()
-	if err := (LogNotifier{}).Notify(context.Background(), task.Task{ID: 1, Title: "задача", DueAt: &due}); err != nil {
+	if err := (LogNotifier{Log: quiet}).Notify(context.Background(), task.Task{ID: 1, Title: "задача", DueAt: &due}); err != nil {
 		t.Errorf("Notify() error = %v, want nil", err)
 	}
 }

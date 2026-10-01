@@ -7,6 +7,18 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      # База для тестов, которые запускают сервис целиком командой serve.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: taskflow
+          POSTGRES_PASSWORD: taskflow
+          POSTGRES_DB: taskflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U taskflow" --health-interval 2s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -16,8 +28,12 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
-      # Без -short: интеграционные тесты сами поднимают PostgreSQL в контейнере.
+      # Без -short: тесты репозитория сами поднимают PostgreSQL через testcontainers.
       - run: go test -race ./...
+      - name: Сервис целиком на настоящей базе
+        env:
+          TASKFLOW_TEST_DSN: postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable
+        run: go test -race -count=1 ./cmd/...
 
   docker:
     runs-on: ubuntu-latest
@@ -25,25 +41,96 @@ jobs:
       - uses: actions/checkout@v4
       - run: cp .env.example .env
       - name: Сборка и запуск
-        run: docker compose up -d --build --wait --wait-timeout 120
+        run: docker compose up -d --build --wait --wait-timeout 180
       - name: Размер образа меньше 30 МБ
         run: |
           size=$(docker image inspect "$(docker compose images -q api)" --format '{{.Size}}')
           echo "Размер образа: $((size / 1024 / 1024)) МБ"
           test "$size" -lt $((30 * 1024 * 1024))
-      - name: Проверка API
-        run: |
-          set -eux
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 -X POST -d '{"title":"из CI"}' localhost:8080/tasks
-          curl -fsS localhost:8080/tasks | grep -q '"title":"из CI"'
+      - name: Главный путь пользователя
+        run: scripts/smoke.sh http://localhost:8080
       - name: Данные переживают пересоздание контейнеров
         run: |
           set -eux
+          before=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM users')
           docker compose down
-          docker compose up -d --wait --wait-timeout 120
-          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 localhost:8080/tasks | grep -q '"title":"из CI"'
+          docker compose up -d --wait --wait-timeout 180
+          after=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM users')
+          test "$before" -ge 1 && test "$before" = "$after"
+      - name: Без Redis сервис не готов, но жив
+        run: |
+          set -eux
+          docker compose stop redis
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/readyz)" = 503
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/healthz)" = 200
+          docker compose start redis
+          curl -fsS --retry 20 --retry-delay 1 --retry-all-errors localhost:8080/readyz
+      - name: Остановка по SIGTERM без ошибок
+        run: |
+          set -eux
+          docker compose stop -t 20 api
+          test "$(docker inspect "$(docker compose ps -aq api)" --format '{{.State.ExitCode}}')" = 0
+          docker compose logs api | grep -q '"msg":"server stopped"'
       - name: Логи при ошибке
         if: failure()
         run: docker compose logs
+      - run: docker compose down -v
+
+      # Боевая схема: тот же образ за Caddy с HTTPS. Домен localhost — Caddy сам выпускает сертификат.
+      - name: Запуск за Caddy с HTTPS
+        run: |
+          set -eux
+          docker build -t ghcr.io/ubicasmerti228/taskflow-reference:latest . # слои уже в кэше, сборка мгновенная
+          docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 180
+          CURL_OPTS=-k scripts/smoke.sh https://localhost
+          # http перенаправляет на https, порт api наружу закрыт.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/healthz)" = 308
+          ! curl -s -m 3 -o /dev/null http://localhost:8080/healthz
+      - name: Логи при ошибке
+        if: failure()
+        run: docker compose --env-file .env -f deploy/compose.prod.yaml logs
       - if: always()
-        run: docker compose down -v
+        run: docker compose --env-file .env -f deploy/compose.prod.yaml down -v
+
+  # Публикация образа: только из main и только после зелёных проверок.
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [check, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # Тег по SHA показывает, какая версия запущена, и позволяет откатиться на конкретную.
+          tags: |
+            ghcr.io/ubicasmerti228/taskflow-reference:${{ github.sha }}
+            ghcr.io/ubicasmerti228/taskflow-reference:latest
+
+  # Выкатка на сервер. Включается, когда в настройках репозитория задана переменная DEPLOY_HOST
+  # и секреты DEPLOY_USER и DEPLOY_SSH_KEY. На сервере в ~/taskflow лежат .env и папка deploy.
+  deploy:
+    if: vars.DEPLOY_HOST != ''
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -eu
+            cd ~/taskflow
+            export TAG=${{ github.sha }}
+            docker compose --env-file .env -f deploy/compose.prod.yaml pull api
+            docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 120

@@ -2,6 +2,7 @@ package task
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -16,6 +17,8 @@ func TestNewTaskNormalize(t *testing.T) {
 		{name: "пробелы обрезаются", title: "\t позвонить \n", want: "позвонить"},
 		{name: "пустой", title: "", wantErr: ErrEmptyTitle},
 		{name: "только пробелы", title: "   ", wantErr: ErrEmptyTitle},
+		{name: "200 символов кириллицей проходят", title: strings.Repeat("я", MaxTitleLen), want: strings.Repeat("я", MaxTitleLen)},
+		{name: "201 символ — слишком длинно", title: strings.Repeat("я", MaxTitleLen+1), wantErr: ErrTitleTooLong},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

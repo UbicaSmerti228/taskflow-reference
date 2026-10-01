@@ -1,10 +1,11 @@
-// Package task описывает задачу и правила, общие для всех хранилищ.
+// Package task описывает задачу и правила работы с ней.
 package task
 
 import (
 	"errors"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Task — одна задача трекера.
@@ -40,17 +41,19 @@ type Filter struct {
 
 // Ошибки, по которым вызывающий код выбирает, что ответить пользователю.
 var (
-	ErrNotFound   = errors.New("task not found")
-	ErrEmptyTitle = errors.New("title is empty")
-	ErrEmptyPatch = errors.New("nothing to update")
+	ErrNotFound     = errors.New("task not found")
+	ErrEmptyTitle   = errors.New("title is empty")
+	ErrTitleTooLong = errors.New("title is too long")
+	ErrEmptyPatch   = errors.New("nothing to update")
 )
 
 // Normalize проверяет данные новой задачи и обрезает пробелы в заголовке.
 func (n NewTask) Normalize() (NewTask, error) {
-	n.Title = strings.TrimSpace(n.Title)
-	if n.Title == "" {
-		return NewTask{}, ErrEmptyTitle
+	title, err := normalizeTitle(n.Title)
+	if err != nil {
+		return NewTask{}, err
 	}
+	n.Title = title
 	return n, nil
 }
 
@@ -60,11 +63,25 @@ func (p Patch) Normalize() (Patch, error) {
 		return Patch{}, ErrEmptyPatch
 	}
 	if p.Title != nil {
-		title := strings.TrimSpace(*p.Title)
-		if title == "" {
-			return Patch{}, ErrEmptyTitle
+		title, err := normalizeTitle(*p.Title)
+		if err != nil {
+			return Patch{}, err
 		}
 		p.Title = &title
 	}
 	return p, nil
+}
+
+// MaxTitleLen — наибольшая длина заголовка в символах.
+const MaxTitleLen = 200
+
+func normalizeTitle(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ErrEmptyTitle
+	}
+	if utf8.RuneCountInString(s) > MaxTitleLen {
+		return "", ErrTitleTooLong
+	}
+	return s, nil
 }

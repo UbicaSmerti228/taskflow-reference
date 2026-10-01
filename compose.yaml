@@ -1,14 +1,26 @@
+# Окружение для разработки: api, postgres и redis одной командой.
 services:
   api:
     build: .
     environment:
-      # Внутри сети compose база доступна по имени сервиса.
+      # Внутри сети compose база и Redis доступны по имени сервиса.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "${API_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy # ждём, пока база начнёт принимать соединения
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # В образе нет оболочки и curl, поэтому готовность проверяет сам бинарник.
+      test: ["CMD", "/taskflow", "healthcheck"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
     restart: unless-stopped
 
   postgres:
@@ -21,6 +33,15 @@ services:
       - pgdata:/var/lib/postgresql # данные переживают пересоздание контейнера
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30

@@ -3,7 +3,7 @@ package reminder
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -29,16 +29,18 @@ type Worker struct {
 	interval time.Duration
 	workers  int
 	now      func() time.Time
+	log      *slog.Logger
 }
 
 // New собирает воркер. Некорректные значения заменяются на минимальные рабочие.
-func New(store Store, notifier Notifier, interval time.Duration, workers int) *Worker {
+func New(store Store, notifier Notifier, interval time.Duration, workers int, log *slog.Logger) *Worker {
 	return &Worker{
 		store:    store,
 		notifier: notifier,
 		interval: max(interval, time.Millisecond),
 		workers:  max(workers, 1),
 		now:      time.Now,
+		log:      log,
 	}
 }
 
@@ -84,7 +86,7 @@ func (w *Worker) Run(ctx context.Context) {
 func (w *Worker) scan(ctx context.Context, jobs chan<- job) {
 	tasks, err := w.store.DueForReminder(ctx, w.now())
 	if err != nil {
-		log.Printf("reminder: %v", err)
+		w.log.ErrorContext(ctx, "reminder scan failed", "err", err)
 		return
 	}
 
@@ -104,20 +106,22 @@ func (w *Worker) scan(ctx context.Context, jobs chan<- job) {
 func (w *Worker) remind(ctx context.Context, t task.Task) {
 	if err := w.notifier.Notify(ctx, t); err != nil {
 		// Отметку не ставим: задача попадёт в следующий обход.
-		log.Printf("reminder: notify task %d: %v", t.ID, err)
+		w.log.WarnContext(ctx, "reminder was not sent", "task_id", t.ID, "err", err)
 		return
 	}
 	// Отметку ставим даже при остановке сервиса: напоминание уже ушло.
 	if err := w.store.MarkReminded(context.WithoutCancel(ctx), t.ID, w.now()); err != nil {
-		log.Printf("reminder: %v", err)
+		w.log.ErrorContext(ctx, "reminder was sent but not marked", "task_id", t.ID, "err", err)
 	}
 }
 
 // LogNotifier пишет напоминание в лог.
-type LogNotifier struct{}
+type LogNotifier struct {
+	Log *slog.Logger
+}
 
-// Notify печатает напоминание о задаче.
-func (LogNotifier) Notify(_ context.Context, t task.Task) error {
-	log.Printf("напоминание: задача %d «%s», срок был %s", t.ID, t.Title, t.DueAt.Format(time.RFC3339))
+// Notify записывает напоминание о задаче.
+func (n LogNotifier) Notify(ctx context.Context, t task.Task) error {
+	n.Log.InfoContext(ctx, "reminder", "task_id", t.ID, "title", t.Title, "due_at", t.DueAt)
 	return nil
 }

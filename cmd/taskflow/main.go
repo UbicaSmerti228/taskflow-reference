@@ -1,210 +1,168 @@
-// Команда taskflow — трекер задач: CLI и HTTP-сервер поверх PostgreSQL.
+// Команда taskflow — сервис трекера задач: HTTP API, воркер напоминаний и миграции базы.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/UbicaSmerti228/taskflow-reference/internal/config"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/httpapi"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/postgres"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/redisstore"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/reminder"
-	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/service"
 )
 
 const usage = `Использование:
-  taskflow add <заголовок>    добавить задачу
-  taskflow list               показать задачи
-  taskflow done <id>          отметить задачу выполненной
-  taskflow migrate            накатить миграции базы
-  taskflow serve [флаги]      накатить миграции, запустить HTTP-сервер и воркер напоминаний
-    -addr :8080               адрес сервера
-    -remind-interval 30s      как часто искать просроченные задачи
-    -workers 4                сколько напоминаний отправлять одновременно
+  taskflow serve        накатить миграции, запустить HTTP-сервер и воркер напоминаний
+  taskflow migrate      только накатить миграции
+  taskflow healthcheck  проверить, что запущенный сервис готов (для healthcheck в Docker)
 
-Адрес базы задаётся переменной DATABASE_URL, например:
-  postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable`
-
-var errUsage = errors.New("неверные аргументы")
-
-// store — всё, что командам нужно от хранилища.
-type store interface {
-	httpapi.Store
-	reminder.Store
-}
-
-// app собирает зависимости команд. В тестах база подменяется хранилищем в памяти.
-type app struct {
-	out     io.Writer
-	migrate func(ctx context.Context) error
-	open    func(ctx context.Context) (s store, closeFn func(), err error)
-}
+Настройки берутся из переменных окружения:
+  DATABASE_URL     адрес PostgreSQL, обязательна
+  REDIS_URL        адрес Redis, обязательна
+  JWT_SECRET       ключ подписи токенов, не меньше 32 байт, обязательна
+  ADDR             адрес сервера, по умолчанию :8080
+  LOG_LEVEL        debug, info, warn или error; по умолчанию info
+  ACCESS_TTL       срок жизни access-токена, по умолчанию 15m
+  REFRESH_TTL      срок жизни refresh-токена, по умолчанию 720h
+  CACHE_TTL        срок жизни задачи в кэше, по умолчанию 1m
+  LOGIN_LIMIT      попыток входа в минуту с одного IP, по умолчанию 10
+  REMIND_INTERVAL  как часто искать просроченные задачи, по умолчанию 30s
+  REMIND_WORKERS   сколько напоминаний отправлять одновременно, по умолчанию 4
+  TRUSTED_PROXIES  адреса прокси через запятую, чьему X-Forwarded-For можно верить`
 
 func main() {
 	// SIGINT и SIGTERM отменяют контекст: сервер успевает завершить текущие запросы.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := newApp(os.Getenv("DATABASE_URL"), os.Stdout).run(ctx, os.Args[1:]); err != nil {
+	if err := run(ctx, os.Args[1:], os.Getenv, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "ошибка:", err)
-		if errors.Is(err, errUsage) {
-			fmt.Fprintln(os.Stderr, usage)
-		}
 		os.Exit(1)
 	}
 }
 
-// newApp связывает команды с PostgreSQL по адресу dsn.
-func newApp(dsn string, out io.Writer) *app {
-	// Без адреса базы не стартуем: лучше упасть сразу с понятной ошибкой, чем на первом запросе.
-	check := func() error {
-		if dsn == "" {
-			return fmt.Errorf("%w: не задана переменная DATABASE_URL", errUsage)
-		}
-		return nil
+func run(ctx context.Context, args []string, getenv func(string) string, out io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("нужна одна команда\n" + usage)
 	}
-	return &app{
-		out: out,
-		migrate: func(ctx context.Context) error {
-			if err := check(); err != nil {
-				return err
-			}
-			return postgres.Migrate(ctx, dsn)
-		},
-		open: func(ctx context.Context) (store, func(), error) {
-			if err := check(); err != nil {
-				return nil, nil, err
-			}
-			pool, err := postgres.Connect(ctx, dsn)
-			if err != nil {
-				return nil, nil, err
-			}
-			s, err := postgres.NewStore(ctx, pool)
-			if err != nil {
-				pool.Close()
-				return nil, nil, err
-			}
-			return s, pool.Close, nil
-		},
-	}
-}
-
-// run выполняет одну команду.
-func (a *app) run(ctx context.Context, args []string) error {
-	if len(args) == 0 {
-		return errUsage
-	}
-	switch cmd, rest := args[0], args[1:]; cmd {
-	case "add":
-		return a.withStore(ctx, func(s store) error {
-			t, err := s.Create(ctx, task.NewTask{Title: strings.Join(rest, " ")})
-			if errors.Is(err, task.ErrEmptyTitle) {
-				return fmt.Errorf("%w: у задачи должен быть заголовок", errUsage)
-			}
-			if err != nil {
-				return err
-			}
-			_, err = fmt.Fprintf(a.out, "Добавлена задача %d: %s\n", t.ID, t.Title)
-			return err
-		})
-
-	case "list":
-		return a.withStore(ctx, func(s store) error {
-			tasks, _, err := s.List(ctx, task.Filter{})
-			if err != nil {
-				return err
-			}
-			if len(tasks) == 0 {
-				_, err = fmt.Fprintln(a.out, "Задач нет.")
-				return err
-			}
-			for _, t := range tasks {
-				mark := " "
-				if t.Done {
-					mark = "x"
-				}
-				if _, err := fmt.Fprintf(a.out, "[%s] %d  %s\n", mark, t.ID, t.Title); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-
-	case "done":
-		if len(rest) != 1 {
-			return fmt.Errorf("%w: укажи id задачи", errUsage)
-		}
-		id, err := strconv.ParseInt(rest[0], 10, 64)
+	switch args[0] {
+	case "serve":
+		cfg, err := config.Load(getenv)
 		if err != nil {
-			return fmt.Errorf("%w: id должен быть числом, а не %q", errUsage, rest[0])
+			// Без настроек не стартуем: лучше упасть сразу с понятной ошибкой, чем на первом запросе.
+			return fmt.Errorf("настройки:\n%w", err)
 		}
-		return a.withStore(ctx, func(s store) error {
-			done := true
-			t, err := s.Update(ctx, id, task.Patch{Done: &done})
-			if errors.Is(err, task.ErrNotFound) {
-				return fmt.Errorf("задачи с id %d нет", id)
-			}
-			if err != nil {
-				return err
-			}
-			_, err = fmt.Fprintf(a.out, "Выполнена задача %d: %s\n", t.ID, t.Title)
-			return err
-		})
+		return serve(ctx, cfg, out)
 
 	case "migrate":
-		if err := a.migrate(ctx); err != nil {
+		dsn := getenv("DATABASE_URL")
+		if dsn == "" {
+			return errors.New("не задана переменная DATABASE_URL")
+		}
+		if err := postgres.Migrate(ctx, dsn); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(a.out, "Миграции применены")
+		_, err := fmt.Fprintln(out, "Миграции применены")
 		return err
 
-	case "serve":
-		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-		addr := fs.String("addr", ":8080", "адрес, на котором слушает сервер")
-		interval := fs.Duration("remind-interval", 30*time.Second, "как часто искать просроченные задачи")
-		workers := fs.Int("workers", 4, "сколько напоминаний отправлять одновременно")
-		if err := fs.Parse(rest); err != nil {
-			return fmt.Errorf("%w: %v", errUsage, err)
-		}
-		// Схема обновляется при каждом старте: отдельный шаг деплоя не нужен.
-		if err := a.migrate(ctx); err != nil {
-			return err
-		}
-		return a.withStore(ctx, func(s store) error {
-			return serve(ctx, s, *addr, *interval, *workers, a.out)
-		})
+	case "healthcheck":
+		return healthcheck(ctx, getenv("ADDR"))
 
 	default:
-		return fmt.Errorf("%w: неизвестная команда %q", errUsage, cmd)
+		return fmt.Errorf("неизвестная команда %q\n%s", args[0], usage)
 	}
 }
 
-// withStore открывает хранилище, выполняет fn и закрывает соединения.
-func (a *app) withStore(ctx context.Context, fn func(s store) error) error {
-	s, closeFn, err := a.open(ctx)
+// serve подключается к базе и Redis и запускает сервис. Это место, где собираются все зависимости:
+// связи между слоями видны целиком, а сами слои знают только про интерфейсы.
+func serve(ctx context.Context, cfg config.Config, out io.Writer) error {
+	log := logging.New(out, cfg.LogLevel)
+
+	// Схема обновляется при каждом старте: отдельный шаг деплоя не нужен.
+	if err := postgres.Migrate(ctx, cfg.DatabaseURL); err != nil {
+		return err
+	}
+	pool, err := postgres.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return err
 	}
-	defer closeFn()
-	return fn(s)
+	defer pool.Close()
+
+	kv, err := redisstore.Connect(ctx, cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	defer kv.Close() //nolint:errcheck // процесс завершается
+
+	tasks := postgres.NewTasks(pool)
+	return runService(ctx, cfg, log, components{
+		taskRepo:  tasks,
+		userRepo:  postgres.NewUsers(pool),
+		reminders: tasks,
+		kv:        kv,
+		ready: map[string]httpapi.Check{
+			"postgres": pool.Ping,
+			"redis":    kv.Ping,
+		},
+	})
 }
 
-// serve запускает HTTP-сервер и воркер напоминаний и работает, пока не отменён ctx.
-func serve(ctx context.Context, s store, addr string, interval time.Duration, workers int, out io.Writer) error {
-	ln, err := net.Listen("tcp", addr)
+// kvStore — всё, что сервису нужно от Redis.
+type kvStore interface {
+	service.Cache
+	service.RefreshStore
+	httpapi.Limiter
+}
+
+// components — хранилища, на которых работает сервис. В тестах сюда попадают хранилища в памяти.
+type components struct {
+	taskRepo  service.TaskRepo
+	userRepo  service.UserRepo
+	reminders reminder.Store
+	kv        kvStore
+	ready     map[string]httpapi.Check
+}
+
+// runService собирает слои и работает, пока не отменён ctx.
+func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c components) error {
+	auth, err := service.NewAuth(c.userRepo, c.kv, service.AuthConfig{
+		Secret:     cfg.JWTSecret,
+		AccessTTL:  cfg.AccessTTL,
+		RefreshTTL: cfg.RefreshTTL,
+	})
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		return err
+	}
+	api, err := httpapi.New(httpapi.Deps{
+		Tasks:          service.NewTasks(c.taskRepo, c.kv, cfg.CacheTTL, log),
+		Auth:           auth,
+		Limiter:        c.kv,
+		Log:            log,
+		Ready:          c.ready,
+		LoginLimit:     cfg.LoginLimit,
+		TrustedProxies: cfg.TrustedProxies,
+	})
+	if err != nil {
+		return err
+	}
+
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Addr, err)
 	}
 
 	ctx, stop := context.WithCancel(ctx)
@@ -212,21 +170,19 @@ func serve(ctx context.Context, s store, addr string, interval time.Duration, wo
 
 	var bg sync.WaitGroup
 	bg.Go(func() {
-		reminder.New(s, reminder.LogNotifier{}, interval, workers).Run(ctx)
+		reminder.New(c.reminders, reminder.LogNotifier{Log: log}, cfg.RemindInterval, cfg.RemindWorkers, log).Run(ctx)
 	})
 
 	srv := &http.Server{
-		Handler:           httpapi.New(s),
+		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       time.Minute,
 	}
 	failed := make(chan error, 1)
 	go func() { failed <- srv.Serve(ln) }()
-
-	if _, err := fmt.Fprintf(out, "Сервер слушает %s\n", ln.Addr()); err != nil {
-		return err
-	}
+	log.Info("server started", "addr", ln.Addr().String())
 
 	select {
 	case err := <-failed:
@@ -236,13 +192,41 @@ func serve(ctx context.Context, s store, addr string, interval time.Duration, wo
 	case <-ctx.Done():
 	}
 
-	// Даём текущим запросам завершиться, потом ждём воркер. Пул базы закроется после возврата.
+	// Остановка по порядку: перестаём называться готовыми, дообрабатываем текущие запросы, ждём воркер.
+	// Соединения с базой и Redis закроются после возврата.
+	log.Info("shutting down")
+	api.StartShutdown()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err = srv.Shutdown(shutdownCtx)
 	bg.Wait()
-	if _, werr := fmt.Fprintln(out, "Сервер остановлен"); err == nil {
-		err = werr
-	}
+	log.Info("server stopped")
 	return err
+}
+
+// healthcheck спрашивает /readyz у сервиса на этой же машине.
+// В образе нет ни оболочки, ни curl, поэтому проверку делает сам бинарник.
+func healthcheck(ctx context.Context, addr string) error {
+	if addr == "" {
+		addr = ":8080"
+	}
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/readyz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck // тело не читаем
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("сервис не готов: /readyz ответил %d", resp.StatusCode)
+	}
+	return nil
 }

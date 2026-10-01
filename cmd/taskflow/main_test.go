@@ -1,218 +1,350 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
-	"github.com/UbicaSmerti228/taskflow-reference/internal/tasktest"
+	"github.com/alicebob/miniredis/v2"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/UbicaSmerti228/taskflow-reference/internal/config"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/httpapi"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/memory"
 )
 
-// testApp собирает приложение на хранилище в памяти и считает обращения к зависимостям.
-type testApp struct {
-	*app
-	store      *tasktest.MemStore
-	migrations int
-	closed     int
-}
-
-func newTestApp(out io.Writer) *testApp {
-	ta := &testApp{store: tasktest.NewMemStore()}
-	ta.app = &app{
-		out:     out,
-		migrate: func(context.Context) error { ta.migrations++; return nil },
-		open: func(context.Context) (store, func(), error) {
-			return ta.store, func() { ta.closed++ }, nil
-		},
-	}
-	return ta
-}
-
-func TestRun(t *testing.T) {
-	var out strings.Builder
-	ta := newTestApp(&out)
-
-	// Шаги идут по порядку и работают с одним хранилищем.
-	steps := []struct {
-		name      string
-		args      []string
-		wantOut   string
-		wantErr   string
-		wantUsage bool
-	}{
-		{name: "пустой список", args: []string{"list"}, wantOut: "Задач нет."},
-		{name: "добавление", args: []string{"add", "купить", "молоко"}, wantOut: "Добавлена задача 1: купить молоко"},
-		{name: "список", args: []string{"list"}, wantOut: "[ ] 1  купить молоко"},
-		{name: "выполнение", args: []string{"done", "1"}, wantOut: "Выполнена задача 1"},
-		{name: "список после выполнения", args: []string{"list"}, wantOut: "[x] 1  купить молоко"},
-		{name: "миграции", args: []string{"migrate"}, wantOut: "Миграции применены"},
-		{name: "неизвестный id", args: []string{"done", "7"}, wantErr: "задачи с id 7 нет"},
-		{name: "id не число", args: []string{"done", "abc"}, wantErr: "id должен быть числом", wantUsage: true},
-		{name: "done без id", args: []string{"done"}, wantErr: "укажи id", wantUsage: true},
-		{name: "пустой заголовок", args: []string{"add"}, wantErr: "заголовок", wantUsage: true},
-		{name: "неизвестная команда", args: []string{"remove"}, wantErr: "неизвестная команда", wantUsage: true},
-		{name: "нет аргументов", args: nil, wantErr: "неверные аргументы", wantUsage: true},
-		{name: "неверный флаг serve", args: []string{"serve", "-port", "1"}, wantErr: "port", wantUsage: true},
-	}
-	for _, st := range steps {
-		t.Run(st.name, func(t *testing.T) {
-			out.Reset()
-			err := ta.run(context.Background(), st.args)
-
-			if st.wantErr == "" {
-				if err != nil {
-					t.Fatalf("run(%v) error = %v", st.args, err)
-				}
-				if !strings.Contains(out.String(), st.wantOut) {
-					t.Errorf("run(%v) напечатал %q, want строку с %q", st.args, out.String(), st.wantOut)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), st.wantErr) {
-				t.Fatalf("run(%v) error = %v, want ошибку с %q", st.args, err, st.wantErr)
-			}
-			if got := errors.Is(err, errUsage); got != st.wantUsage {
-				t.Errorf("run(%v): errors.Is(err, errUsage) = %v, want %v", st.args, got, st.wantUsage)
-			}
-		})
-	}
-	if ta.migrations != 1 {
-		t.Errorf("миграции запускались %d раз, want 1: только по команде migrate", ta.migrations)
-	}
-}
-
-func TestRunStoreErrors(t *testing.T) {
-	boom := errors.New("база недоступна")
-
-	t.Run("хранилище не открылось", func(t *testing.T) {
-		ta := newTestApp(io.Discard)
-		ta.open = func(context.Context) (store, func(), error) { return nil, nil, boom }
-		for _, args := range [][]string{{"add", "a"}, {"list"}, {"done", "1"}} {
-			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
-				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
-			}
-		}
-	})
-
-	t.Run("запрос упал, соединения закрыты", func(t *testing.T) {
-		ta := newTestApp(io.Discard)
-		ta.store.Err = boom
-		for _, args := range [][]string{{"add", "a"}, {"list"}, {"done", "1"}} {
-			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
-				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
-			}
-		}
-		if ta.closed != 3 {
-			t.Errorf("хранилище закрыто %d раз, want 3", ta.closed)
-		}
-	})
-
-	t.Run("миграции упали — сервер не стартует", func(t *testing.T) {
-		ta := newTestApp(io.Discard)
-		ta.migrate = func(context.Context) error { return boom }
-		opened := false
-		ta.open = func(context.Context) (store, func(), error) { opened = true; return ta.store, func() {}, nil }
-
-		for _, args := range [][]string{{"migrate"}, {"serve", "-addr", "127.0.0.1:0"}} {
-			if err := ta.run(context.Background(), args); !errors.Is(err, boom) {
-				t.Errorf("run(%v) error = %v, want %v", args, err, boom)
-			}
-		}
-		if opened {
-			t.Error("хранилище открыто, хотя миграции упали")
-		}
-	})
-}
-
-func TestNewAppRequiresDatabaseURL(t *testing.T) {
-	a := newApp("", io.Discard)
-	for _, args := range [][]string{{"list"}, {"migrate"}, {"serve"}} {
-		err := a.run(context.Background(), args)
-		if !errors.Is(err, errUsage) || !strings.Contains(err.Error(), "DATABASE_URL") {
-			t.Errorf("run(%v) без DATABASE_URL: error = %v, want подсказку про DATABASE_URL", args, err)
-		}
-	}
-}
-
-func TestServe(t *testing.T) {
-	pr, pw := io.Pipe()
-	ta := newTestApp(pw)
-	past := time.Now().Add(-time.Minute)
-	if _, err := ta.store.Create(context.Background(), task.NewTask{Title: "просрочена", DueAt: &past}); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		// Порт 0 — система сама выберет свободный, адрес узнаём из вывода.
-		done <- ta.run(ctx, []string{"serve", "-addr", "127.0.0.1:0", "-remind-interval", "5ms"})
-		pw.Close() //nolint:errcheck // у PipeWriter Close всегда возвращает nil
-	}()
-
-	lines := bufio.NewScanner(pr)
-	if !lines.Scan() {
-		t.Fatalf("сервер ничего не напечатал: %v", <-done)
-	}
-	addr := strings.TrimPrefix(lines.Text(), "Сервер слушает ")
-
-	resp, err := http.Get("http://" + addr + "/tasks")
+// cleanup очищает таблицы тестовой базы.
+func cleanup(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close() //nolint:errcheck // тело не читаем
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET /tasks status = %d, want 200", resp.StatusCode)
+	defer conn.Close(ctx) //nolint:errcheck // тест
+	if _, err := conn.Exec(ctx, `TRUNCATE users, tasks RESTART IDENTITY`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const testSecret = "0123456789abcdef0123456789abcdef"
+
+func getenv(vars map[string]string) func(string) string {
+	return func(name string) string { return vars[name] }
+}
+
+func TestRunArguments(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name string
+		args []string
+		env  map[string]string
+		want string
+	}{
+		{name: "нет команды", args: nil, want: "Использование"},
+		{name: "две команды", args: []string{"serve", "migrate"}, want: "Использование"},
+		{name: "неизвестная команда", args: []string{"add"}, want: `неизвестная команда "add"`},
+		{name: "migrate без адреса базы", args: []string{"migrate"}, want: "DATABASE_URL"},
+		// serve называет сразу все недостающие переменные.
+		{name: "serve без настроек", args: []string{"serve"}, want: "REDIS_URL"},
+		{name: "serve с коротким секретом", args: []string{"serve"}, env: map[string]string{"DATABASE_URL": "x", "REDIS_URL": "y", "JWT_SECRET": "короткий"}, want: "JWT_SECRET"},
+		{name: "serve с недоступной базой", args: []string{"serve"}, env: map[string]string{"DATABASE_URL": "postgres://u:p@127.0.0.1:1/db?sslmode=disable&connect_timeout=2", "REDIS_URL": "redis://127.0.0.1:1", "JWT_SECRET": testSecret}, want: "migrations"},
+		{name: "healthcheck без сервиса", args: []string{"healthcheck"}, env: map[string]string{"ADDR": "127.0.0.1:1"}, want: "connect"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := run(ctx, tt.args, getenv(tt.env), io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("run(%v) error = %v, want ошибку с %q", tt.args, err, tt.want)
+			}
+		})
+	}
+}
+
+// syncBuffer — буфер, в который сервис пишет логи из своих горутин, пока тест их читает.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// startService запускает сервис в горутине и возвращает его адрес и функцию остановки.
+func startService(t *testing.T, start func(ctx context.Context, addr string, logs io.Writer) error) (base string, logs *syncBuffer, stop func() error) {
+	t.Helper()
+	// Узнаём свободный порт: занимаем его и сразу отпускаем.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() //nolint:errcheck // порт нужен только на мгновение
+
+	ctx, cancel := context.WithCancel(context.Background())
+	logs = &syncBuffer{}
+	done := make(chan error, 1)
+	go func() { done <- start(ctx, addr, logs) }()
+
+	base = "http://" + addr
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("сервис завершился при старте: %v\n%s", err, logs)
+		default:
+		}
+		if resp, err := http.Get(base + "/healthz"); err == nil {
+			resp.Body.Close() //nolint:errcheck // тело не читаем
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("сервис не поднялся за 10 секунд\n%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Воркер напоминаний работает рядом с сервером.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		got, err := ta.store.Get(context.Background(), 1)
-		if err != nil {
-			t.Fatal(err)
+	stopped := false
+	stop = func() error {
+		if stopped {
+			return nil
 		}
+		stopped = true
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(15 * time.Second):
+			return fmt.Errorf("сервис не остановился за 15 секунд")
+		}
+	}
+	t.Cleanup(func() { stop() }) //nolint:errcheck // тест уже завершён
+	return base, logs, stop
+}
+
+// call отправляет JSON-запрос и разбирает ответ в out (если он задан).
+func call(t *testing.T, method, url, token, body string, out any) int {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // тест
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			t.Fatalf("%s %s: ответ не JSON: %v", method, url, err)
+		}
+	}
+	return resp.StatusCode
+}
+
+// scenario проходит главный путь пользователя через настоящий HTTP.
+func scenario(t *testing.T, base string) {
+	t.Helper()
+	creds := `{"email":"ann@example.com","password":"correct horse"}`
+	if code := call(t, "POST", base+"/api/v1/auth/register", "", creds, nil); code != http.StatusCreated {
+		t.Fatalf("register: status %d", code)
+	}
+	var tokens struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if code := call(t, "POST", base+"/api/v1/auth/login", "", creds, &tokens); code != http.StatusOK {
+		t.Fatalf("login: status %d", code)
+	}
+
+	past := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if code := call(t, "POST", base+"/api/v1/tasks", tokens.AccessToken, `{"title":"сдать отчёт","due_at":"`+past+`"}`, &created); code != http.StatusCreated {
+		t.Fatalf("create task: status %d", code)
+	}
+	taskURL := fmt.Sprintf("%s/api/v1/tasks/%d", base, created.ID)
+
+	// Воркер напоминаний работает рядом с сервером и отмечает просроченную задачу.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var got struct {
+			RemindedAt *time.Time `json:"reminded_at"`
+		}
+		// PATCH сбрасывает кэш, поэтому читаем через список, который не кэшируется.
+		var list struct {
+			Items []struct {
+				RemindedAt *time.Time `json:"reminded_at"`
+			} `json:"items"`
+		}
+		if code := call(t, "GET", base+"/api/v1/tasks", tokens.AccessToken, "", &list); code != http.StatusOK || len(list.Items) != 1 {
+			t.Fatalf("list tasks: status %d, задач %d", code, len(list.Items))
+		}
+		got.RemindedAt = list.Items[0].RemindedAt
 		if got.RemindedAt != nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("воркер не отправил напоминание за 5 секунд")
+			t.Fatal("воркер не отправил напоминание за 10 секунд")
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 
-	cancel()
-	if !lines.Scan() || lines.Text() != "Сервер остановлен" {
-		t.Errorf("после отмены напечатано %q, want «Сервер остановлен»", lines.Text())
+	if code := call(t, "GET", taskURL, "", "", nil); code != http.StatusUnauthorized {
+		t.Errorf("задача без токена: status %d, want 401", code)
 	}
-	if err := <-done; err != nil {
-		t.Errorf("serve вернул %v, want nil", err)
+	if code := call(t, "PATCH", taskURL, tokens.AccessToken, `{"done":true}`, nil); code != http.StatusOK {
+		t.Errorf("patch task: status %d", code)
 	}
-	if _, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		t.Error("после остановки порт всё ещё принимает соединения")
+	if code := call(t, "POST", base+"/api/v1/auth/refresh", "", `{"refresh_token":"`+tokens.RefreshToken+`"}`, &tokens); code != http.StatusOK {
+		t.Errorf("refresh: status %d", code)
 	}
-	if ta.migrations != 1 || ta.closed != 1 {
-		t.Errorf("миграции: %d, закрытий хранилища: %d; want 1 и 1", ta.migrations, ta.closed)
+	if code := call(t, "DELETE", taskURL, tokens.AccessToken, "", nil); code != http.StatusNoContent {
+		t.Errorf("delete task новым токеном: status %d", code)
+	}
+	if code := call(t, "GET", base+"/readyz", "", "", nil); code != http.StatusOK {
+		t.Errorf("/readyz: status %d", code)
 	}
 }
 
-func TestServeBusyPort(t *testing.T) {
+// Сервис на хранилищах в памяти: проверяет сборку слоёв, запуск и остановку без базы и Redis.
+func TestRunService(t *testing.T) {
+	tasks, kv := memory.NewTasks(), memory.NewKV()
+	base, logs, stop := startService(t, func(ctx context.Context, addr string, out io.Writer) error {
+		cfg := config.Config{
+			Addr: addr, JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, CacheTTL: time.Minute,
+			RemindInterval: 10 * time.Millisecond, RemindWorkers: 2, LoginLimit: 100,
+		}
+		return runService(ctx, cfg, logging.New(out, slog.LevelDebug), components{
+			taskRepo: tasks, userRepo: memory.NewUsers(), reminders: tasks, kv: kv,
+			ready: map[string]httpapi.Check{},
+		})
+	})
+
+	scenario(t, base)
+
+	if err := healthcheck(context.Background(), strings.TrimPrefix(base, "http://")); err != nil {
+		t.Errorf("healthcheck работающего сервиса: %v", err)
+	}
+	if err := stop(); err != nil {
+		t.Errorf("остановка: %v", err)
+	}
+	if _, err := net.DialTimeout("tcp", strings.TrimPrefix(base, "http://"), time.Second); err == nil {
+		t.Error("после остановки порт всё ещё принимает соединения")
+	}
+	out := logs.String()
+	for _, want := range []string{`"msg":"server started"`, `"msg":"reminder"`, `"msg":"shutting down"`, `"msg":"server stopped"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в логе нет записи %s", want)
+		}
+	}
+	if strings.Contains(out, "correct horse") || strings.Contains(out, testSecret) {
+		t.Error("в лог попал пароль или секрет")
+	}
+}
+
+func TestRunServiceErrors(t *testing.T) {
+	tasks := memory.NewTasks()
+	c := components{taskRepo: tasks, userRepo: memory.NewUsers(), reminders: tasks, kv: memory.NewKV()}
+	log := logging.New(io.Discard, slog.LevelInfo)
+	good := config.Config{Addr: "127.0.0.1:0", JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, RemindInterval: time.Second, RemindWorkers: 1}
+
+	short := good
+	short.JWTSecret = []byte("короткий")
+	if err := runService(context.Background(), short, log, c); err == nil {
+		t.Error("короткий секрет: runService вернул nil, want ошибку")
+	}
+
+	badProxy := good
+	badProxy.TrustedProxies = []string{"не адрес"}
+	if err := runService(context.Background(), badProxy, log, c); err == nil {
+		t.Error("неверный адрес прокси: runService вернул nil, want ошибку")
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close() //nolint:errcheck // тест завершается
+	busy := good
+	busy.Addr = ln.Addr().String()
+	if err := runService(context.Background(), busy, log, c); err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Errorf("занятый порт: error = %v, want ошибку listen", err)
+	}
+}
 
-	err = newTestApp(io.Discard).run(context.Background(), []string{"serve", "-addr", ln.Addr().String()})
-	if err == nil || !strings.Contains(err.Error(), "listen") {
-		t.Errorf("serve на занятом порту вернул %v, want ошибку listen", err)
+// Полный запуск командой serve на настоящем PostgreSQL. Redis заменён на miniredis — он говорит по тому же протоколу.
+// Нужна база: TASKFLOW_TEST_DSN. В CI тот же путь проверяет запуск через docker compose.
+func TestServeWithPostgres(t *testing.T) {
+	dsn := os.Getenv("TASKFLOW_TEST_DSN")
+	if dsn == "" {
+		t.Skip("интеграционный тест: задай TASKFLOW_TEST_DSN")
+	}
+	mr := miniredis.RunT(t)
+
+	base, logs, stop := startService(t, func(ctx context.Context, addr string, out io.Writer) error {
+		return run(ctx, []string{"serve"}, getenv(map[string]string{
+			"DATABASE_URL": dsn, "REDIS_URL": "redis://" + mr.Addr(), "JWT_SECRET": testSecret,
+			"ADDR": addr, "REMIND_INTERVAL": "20ms", "LOG_LEVEL": "debug",
+		}), out)
+	})
+	// Сценарий регистрирует пользователя заново — убираем следы прошлого запуска.
+	cleanup(t, dsn)
+
+	scenario(t, base)
+
+	if err := run(context.Background(), []string{"healthcheck"}, getenv(map[string]string{"ADDR": strings.TrimPrefix(base, "http://")}), io.Discard); err != nil {
+		t.Errorf("healthcheck: %v", err)
+	}
+	// Без Redis сервис перестаёт быть готовым, но остаётся живым.
+	mr.Close()
+	if code := call(t, "GET", base+"/readyz", "", "", nil); code != http.StatusServiceUnavailable {
+		t.Errorf("/readyz без Redis: status %d, want 503", code)
+	}
+	if code := call(t, "GET", base+"/healthz", "", "", nil); code != http.StatusOK {
+		t.Errorf("/healthz без Redis: status %d, want 200", code)
+	}
+	if err := stop(); err != nil {
+		t.Errorf("остановка: %v\n%s", err, logs)
+	}
+}
+
+func TestMigrateCommand(t *testing.T) {
+	dsn := os.Getenv("TASKFLOW_TEST_DSN")
+	if dsn == "" {
+		t.Skip("интеграционный тест: задай TASKFLOW_TEST_DSN")
+	}
+	var out bytes.Buffer
+	if err := run(context.Background(), []string{"migrate"}, getenv(map[string]string{"DATABASE_URL": dsn}), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Миграции применены") {
+		t.Errorf("вывод = %q, want «Миграции применены»", out.String())
 	}
 }

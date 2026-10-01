@@ -1,15 +1,137 @@
 openapi: 3.0.3
 info:
   title: TaskFlow API
-  version: 0.3.0
-  description: Трекер задач. Все ошибки приходят в одном формате, см. схему Error.
+  version: 0.4.0
+  description: |
+    Трекер задач. Задачи доступны только владельцу: каждый запрос к ним требует access-токен.
+    Все ошибки приходят в одном формате, см. схему Error.
 servers:
   - url: http://localhost:8080
+tags:
+  - name: auth
+  - name: tasks
+  - name: health
 paths:
-  /tasks:
+  /healthz:
     get:
-      summary: Список задач
+      tags: [health]
+      summary: Процесс жив
+      operationId: healthz
+      responses:
+        "200":
+          description: Сервис отвечает
+  /readyz:
+    get:
+      tags: [health]
+      summary: Сервис готов принимать запросы
+      operationId: readyz
+      responses:
+        "200":
+          description: База и Redis доступны
+        "503":
+          description: Зависимость недоступна или сервис останавливается
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Регистрация
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "201":
+          description: Пользователь создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "409":
+          description: Email уже занят
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Вход
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Credentials"
+      responses:
+        "200":
+          description: Пара токенов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tokens"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          description: Неверный email или пароль. Ответ одинаков в обоих случаях.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Обменять refresh-токен на новую пару
+      description: Старый refresh-токен после обмена перестаёт работать.
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: Новая пара токенов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tokens"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Отозвать refresh-токен
+      operationId: logout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "204":
+          description: Токен отозван
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+  /api/v1/tasks:
+    get:
+      tags: [tasks]
+      summary: Список задач пользователя
       operationId: listTasks
+      security:
+        - bearerAuth: []
       parameters:
         - name: limit
           in: query
@@ -47,11 +169,14 @@ paths:
                 $ref: "#/components/schemas/TaskList"
         "400":
           $ref: "#/components/responses/InvalidArgument"
-        "500":
-          $ref: "#/components/responses/Internal"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     post:
+      tags: [tasks]
       summary: Создать задачу
       operationId: createTask
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -66,18 +191,18 @@ paths:
               description: Адрес созданной задачи
               schema:
                 type: string
-                example: /tasks/1
+                example: /api/v1/tasks/1
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Task"
         "400":
           $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "413":
           $ref: "#/components/responses/TooLarge"
-        "500":
-          $ref: "#/components/responses/Internal"
-  /tasks/{id}:
+  /api/v1/tasks/{id}:
     parameters:
       - name: id
         in: path
@@ -87,8 +212,11 @@ paths:
           format: int64
           minimum: 1
     get:
+      tags: [tasks]
       summary: Получить задачу
       operationId: getTask
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Задача
@@ -98,13 +226,16 @@ paths:
                 $ref: "#/components/schemas/Task"
         "400":
           $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/Internal"
     patch:
+      tags: [tasks]
       summary: Изменить часть полей задачи
       operationId: updateTask
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -120,26 +251,82 @@ paths:
                 $ref: "#/components/schemas/Task"
         "400":
           $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "413":
           $ref: "#/components/responses/TooLarge"
-        "500":
-          $ref: "#/components/responses/Internal"
     delete:
+      tags: [tasks]
       summary: Удалить задачу
       operationId: deleteTask
+      security:
+        - bearerAuth: []
       responses:
         "204":
           description: Задача удалена
         "400":
           $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-        "500":
-          $ref: "#/components/responses/Internal"
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access-токен из ответа /api/v1/auth/login. Живёт 15 минут.
   schemas:
+    Credentials:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          minLength: 8
+          maxLength: 72
+    User:
+      type: object
+      required: [id, email, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        email:
+          type: string
+          format: email
+        created_at:
+          type: string
+          format: date-time
+    Tokens:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: JWT для заголовка Authorization
+        refresh_token:
+          type: string
+          description: Одноразовый токен для получения новой пары. Хранится на сервере, его можно отозвать.
+        expires_in:
+          type: integer
+          description: Время жизни access-токена в секундах
+          example: 900
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
     Task:
       type: object
       required: [id, title, done, created_at]
@@ -172,6 +359,7 @@ components:
         title:
           type: string
           minLength: 1
+          maxLength: 200
         due_at:
           type: string
           format: date-time
@@ -184,6 +372,7 @@ components:
         title:
           type: string
           minLength: 1
+          maxLength: 200
         done:
           type: boolean
         due_at:
@@ -215,13 +404,39 @@ components:
       properties:
         error:
           type: object
-          required: [code, message]
+          required: [code, message, request_id]
           properties:
             code:
               type: string
-              enum: [invalid_argument, not_found, method_not_allowed, too_large, internal]
+              enum:
+                - invalid_argument
+                - unauthenticated
+                - invalid_credentials
+                - invalid_token
+                - not_found
+                - method_not_allowed
+                - conflict
+                - too_large
+                - rate_limited
+                - internal
             message:
               type: string
+            fields:
+              type: array
+              description: Поля, не прошедшие проверку. Приходят все сразу.
+              items:
+                type: object
+                required: [field, rule]
+                properties:
+                  field:
+                    type: string
+                    example: email
+                  rule:
+                    type: string
+                    example: required
+            request_id:
+              type: string
+              description: Идентификатор запроса. По нему запрос находится в логах сервера.
   responses:
     InvalidArgument:
       description: Неверный запрос
@@ -232,25 +447,36 @@ components:
           example:
             error:
               code: invalid_argument
-              message: title is required
-    NotFound:
-      description: Задачи с таким id нет
+              message: validation failed
+              fields:
+                - field: title
+                  rule: required
+              request_id: 01999f3a-7c11-7a52-9d3e-3b0f6a2c8e41
+    Unauthorized:
+      description: Токена нет, он неверный или просрочен
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example:
-            error:
-              code: not_found
-              message: task not found
+    NotFound:
+      description: Задачи с таким id у пользователя нет. Чужая задача тоже отвечает 404.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     TooLarge:
       description: Тело запроса больше 1 МБ
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-    Internal:
-      description: Внутренняя ошибка. Подробности остаются в логе сервера.
+    RateLimited:
+      description: Слишком много попыток с одного адреса
+      headers:
+        Retry-After:
+          description: Через сколько секунд повторить
+          schema:
+            type: integer
       content:
         application/json:
           schema:

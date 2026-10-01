@@ -1,16 +1,15 @@
 BINARY ?= bin/taskflow
-ADDR ?= :8080
 
-.PHONY: help build run test test-short cover lint up down
+.PHONY: help build run test test-short cover lint up down smoke
 
 help: ## показать список целей
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-11s %s\n", $$1, $$2}'
 
 build: ## собрать бинарник
-	go build -o $(BINARY) ./cmd/taskflow
+	go build -tags nomsgpack -o $(BINARY) ./cmd/taskflow
 
-run: build ## запустить сервер (нужна переменная DATABASE_URL)
-	$(BINARY) serve -addr $(ADDR)
+run: build ## запустить сервер (нужны DATABASE_URL, REDIS_URL и JWT_SECRET)
+	$(BINARY) serve
 
 test: ## все тесты; интеграционные поднимают PostgreSQL в Docker
 	go test -race ./...
@@ -18,11 +17,14 @@ test: ## все тесты; интеграционные поднимают Post
 test-short: ## только быстрые тесты, без Docker
 	go test -race -short ./...
 
-up: ## поднять api и postgres в Docker
+up: ## поднять api, postgres и redis в Docker
 	docker compose up -d --build --wait
 
 down: ## остановить контейнеры, данные остаются в томе
 	docker compose down
+
+smoke: ## проверить запущенный сервис через HTTP (нужны curl и jq)
+	scripts/smoke.sh
 
 cover: ## покрытие по всему проекту
 	go test -coverprofile=cover.out ./...
