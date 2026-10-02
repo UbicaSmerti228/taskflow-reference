@@ -1,5 +1,9 @@
-# Боевой запуск: наружу смотрит только Caddy, образ api берётся из registry.
+# Боевой запуск: наружу смотрит только Caddy, образы сервисов берутся из registry.
 # Запуск из корня репозитория:  docker compose --env-file .env -f deploy/compose.prod.yaml up -d
+#
+# Наружу открыты только порты 80 и 443. Метрики, pprof, gRPC, Kafka и Prometheus живут во внутренней сети.
+# Grafana слушает только localhost сервера: до неё добираются через SSH-туннель
+#   ssh -L 3000:localhost:3000 user@server   и затем http://localhost:3000
 services:
   caddy:
     image: caddy:2-alpine
@@ -22,6 +26,8 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      NOTIFIER_ADDR: notifier:9000
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       WEBHOOK_URL: ${WEBHOOK_URL:-}
@@ -38,6 +44,24 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/taskflow", "healthcheck"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+    restart: unless-stopped
+
+  notifier:
+    image: ghcr.io/ubicasmerti228/taskflow-reference/notifier:${TAG:-latest}
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/notifier", "healthcheck"]
       interval: 5s
       timeout: 4s
       retries: 12
@@ -69,8 +93,57 @@ services:
       retries: 30
     restart: unless-stopped
 
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus # история метрик переживает перезапуск
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?задай GRAFANA_PASSWORD в .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000" # только с самого сервера
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
+  kafkadata:
+  promdata:
+  grafanadata:
   caddy_data:
   caddy_config:

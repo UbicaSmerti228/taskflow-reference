@@ -11,19 +11,32 @@ import (
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
 
+// Metrics получает длительность и исход каждого обращения к хранилищу. Реализация — в пакете metrics.
+type Metrics interface {
+	Call(op string, failed bool, took time.Duration)
+}
+
+type noMetrics struct{}
+
+func (noMetrics) Call(string, bool, time.Duration) {}
+
 // tasks — декоратор: реализует тот же интерфейс, что и обёрнутое хранилище,
 // и до и после каждого вызова делает своё. Сервис не знает, что работает через обёртку.
 type tasks struct {
-	next service.TaskRepo
-	log  *slog.Logger
-	slow time.Duration
-	now  func() time.Time
+	next    service.TaskRepo
+	log     *slog.Logger
+	slow    time.Duration
+	metrics Metrics
+	now     func() time.Time
 }
 
-// Tasks оборачивает хранилище задач: каждый вызов пишется в лог с длительностью,
-// медленные (дольше slow) и неудачные — с уровнем warn и error.
-func Tasks(next service.TaskRepo, log *slog.Logger, slow time.Duration) service.TaskRepo {
-	return &tasks{next: next, log: log, slow: slow, now: time.Now}
+// Tasks оборачивает хранилище задач: каждый вызов попадает в метрики и в лог с длительностью,
+// медленные (дольше slow) и неудачные — с уровнем warn и error. metrics может быть nil.
+func Tasks(next service.TaskRepo, log *slog.Logger, slow time.Duration, metrics Metrics) service.TaskRepo {
+	if metrics == nil {
+		metrics = noMetrics{}
+	}
+	return &tasks{next: next, log: log, slow: slow, metrics: metrics, now: time.Now}
 }
 
 // observe возвращает функцию, которую вызывают после операции: defer d.observe(...)(&err).
@@ -32,9 +45,11 @@ func (d *tasks) observe(ctx context.Context, op string) func(*error) {
 	return func(errp *error) {
 		took := d.now().Sub(start)
 		err := *errp
-		switch {
 		// «Не найдено» и отмена запроса клиентом — обычные исходы, а не сбой хранилища.
-		case err != nil && !errors.Is(err, task.ErrNotFound) && !errors.Is(err, context.Canceled):
+		failed := err != nil && !errors.Is(err, task.ErrNotFound) && !errors.Is(err, context.Canceled)
+		d.metrics.Call(op, failed, took)
+		switch {
+		case failed:
 			d.log.ErrorContext(ctx, "repository call failed", "op", op, "duration_ms", took.Milliseconds(), "err", err)
 		case took >= d.slow:
 			d.log.WarnContext(ctx, "slow repository call", "op", op, "duration_ms", took.Milliseconds())

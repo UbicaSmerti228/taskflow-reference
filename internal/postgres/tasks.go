@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/UbicaSmerti228/taskflow-reference/internal/event"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
 
@@ -26,11 +27,23 @@ func NewTasks(pool *pgxpool.Pool) *Tasks { return &Tasks{pool: pool} }
 
 // Connect открывает пул соединений и проверяет, что база отвечает.
 func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	return connect(ctx, dsn, "")
+}
+
+// ConnectSchema открывает пул, все соединения которого работают в схеме schema.
+func ConnectSchema(ctx context.Context, dsn, schema string) (*pgxpool.Pool, error) {
+	return connect(ctx, dsn, schema)
+}
+
+func connect(ctx context.Context, dsn, schema string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
 	}
 	cfg.MaxConns = 10
+	if schema != "" {
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -43,15 +56,22 @@ func Connect(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Create создаёт задачу пользователя.
+// Create создаёт задачу пользователя и в той же транзакции записывает событие «задача создана».
+// Либо в базе есть и задача, и событие, либо нет ни того, ни другого: это и есть transactional outbox.
 func (s *Tasks) Create(ctx context.Context, userID int64, in task.NewTask) (task.Task, error) {
-	rows, err := s.pool.Query(ctx,
-		`INSERT INTO tasks (user_id, title, due_at) VALUES ($1, $2, $3) RETURNING `+taskColumns,
-		userID, in.Title, in.DueAt)
-	if err != nil {
-		return task.Task{}, fmt.Errorf("create task: %w", err)
-	}
-	t, err := pgx.CollectExactlyOneRow(rows, scanTask)
+	var t task.Task
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`INSERT INTO tasks (user_id, title, due_at) VALUES ($1, $2, $3) RETURNING `+taskColumns,
+			userID, in.Title, in.DueAt)
+		if err != nil {
+			return err
+		}
+		if t, err = pgx.CollectExactlyOneRow(rows, scanTask); err != nil {
+			return err
+		}
+		return addEvent(ctx, tx, event.TaskCreated(userID, t))
+	})
 	if err != nil {
 		return task.Task{}, fmt.Errorf("create task: %w", err)
 	}
@@ -158,14 +178,29 @@ func (s *Tasks) DueForReminder(ctx context.Context, now time.Time) ([]task.Task,
 	return tasks, nil
 }
 
-// MarkReminded запоминает, что напоминание по задаче отправлено.
+// MarkReminded запоминает, что напоминание по задаче отправлено, и в той же транзакции
+// записывает событие «срок наступил».
 func (s *Tasks) MarkReminded(ctx context.Context, id int64, at time.Time) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE tasks SET reminded_at = $2 WHERE id = $1`, id, at)
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx,
+			`UPDATE tasks SET reminded_at = $2 WHERE id = $1 RETURNING user_id, `+taskColumns, id, at)
+		if err != nil {
+			return err
+		}
+		var userID int64
+		t, err := pgx.CollectExactlyOneRow(rows, func(row pgx.CollectableRow) (task.Task, error) {
+			var t task.Task
+			err := row.Scan(&userID, &t.ID, &t.Title, &t.Done, &t.DueAt, &t.RemindedAt, &t.CreatedAt)
+			return t, err
+		})
+		if err != nil {
+			return notFound(err)
+		}
+		t.DueAt = utc(t.DueAt)
+		return addEvent(ctx, tx, event.TaskDue(userID, t, at))
+	})
 	if err != nil {
 		return fmt.Errorf("mark task %d reminded: %w", id, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("mark task %d reminded: %w", id, task.ErrNotFound)
 	}
 	return nil
 }

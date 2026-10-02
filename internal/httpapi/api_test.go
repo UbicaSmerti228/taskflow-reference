@@ -17,6 +17,7 @@ import (
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/memory"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/notification"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/service"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
@@ -30,11 +31,35 @@ type env struct {
 	kv    *memory.KV
 	logs  *bytes.Buffer
 	ready map[string]Check
+	notes *fakeNotifications
+	seen  *requests
+}
+
+// fakeNotifications изображает соседний сервис: отдаёт заранее заданный ответ и помнит, что у него спросили.
+type fakeNotifications struct {
+	items    []notification.Notification
+	err      error
+	userID   int64
+	limit    int
+	beforeID int64
+}
+
+func (f *fakeNotifications) List(_ context.Context, userID int64, limit int, beforeID int64) ([]notification.Notification, error) {
+	f.userID, f.limit, f.beforeID = userID, limit, beforeID
+	return f.items, f.err
+}
+
+// requests — метрики, которые можно прочитать в тесте: «метод маршрут статус» → сколько раз.
+type requests struct{ n map[string]int }
+
+func (r *requests) Request(method, route string, status int, _ time.Duration) {
+	r.n[fmt.Sprintf("%s %s %d", method, route, status)]++
 }
 
 func newEnv(t testing.TB) *env {
 	t.Helper()
-	e := &env{t: t, tasks: memory.NewTasks(), users: memory.NewUsers(), kv: memory.NewKV(), logs: &bytes.Buffer{}, ready: map[string]Check{}}
+	e := &env{t: t, tasks: memory.NewTasks(), users: memory.NewUsers(), kv: memory.NewKV(), logs: &bytes.Buffer{}, ready: map[string]Check{},
+		notes: &fakeNotifications{}, seen: &requests{n: map[string]int{}}}
 	log := logging.New(e.logs, slog.LevelDebug)
 
 	auth, err := service.NewAuth(e.users, e.kv, service.AuthConfig{
@@ -47,12 +72,14 @@ func newEnv(t testing.TB) *env {
 		t.Fatal(err)
 	}
 	api, err := New(Deps{
-		Tasks:      service.NewTasks(e.tasks, e.kv, time.Minute, log),
-		Auth:       auth,
-		Limiter:    e.kv,
-		Log:        log,
-		Ready:      e.ready,
-		LoginLimit: 1000, // тест ограничения частоты ставит своё значение
+		Tasks:         service.NewTasks(e.tasks, e.kv, time.Minute, log),
+		Auth:          auth,
+		Notifications: e.notes,
+		Limiter:       e.kv,
+		Log:           log,
+		Metrics:       e.seen,
+		Ready:         e.ready,
+		LoginLimit:    1000, // тест ограничения частоты ставит своё значение
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -539,5 +566,99 @@ func (brokenLimiter) Allow(context.Context, string, int, time.Duration) (bool, e
 func TestNewRejectsBadProxies(t *testing.T) {
 	if _, err := New(Deps{TrustedProxies: []string{"не адрес"}}); err == nil {
 		t.Error("New с неверным адресом прокси вернул nil, want ошибку")
+	}
+}
+
+// ---------- уведомления ----------
+
+func TestListNotifications(t *testing.T) {
+	e := newEnv(t)
+	token := e.login("ann@example.com").AccessToken
+	at := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	e.notes.items = []notification.Notification{
+		{ID: 9, UserID: 1, Kind: notification.KindTaskDue, TaskID: 7, Title: "сдать отчёт", CreatedAt: at},
+		{ID: 8, UserID: 1, Kind: notification.KindTaskCreated, TaskID: 7, Title: "сдать отчёт", CreatedAt: at},
+	}
+
+	rec := e.do("GET", "/api/v1/notifications?limit=2&before_id=30", token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, тело: %s", rec.Code, rec.Body)
+	}
+	// Пользователь взят из токена, параметры страницы — из запроса.
+	if e.notes.userID != 1 || e.notes.limit != 2 || e.notes.beforeID != 30 {
+		t.Errorf("сервису передано: пользователь %d, limit %d, before_id %d", e.notes.userID, e.notes.limit, e.notes.beforeID)
+	}
+	want := `{"items":[{"id":9,"kind":"task.due","task_id":7,"title":"сдать отчёт","created_at":"2026-05-01T10:00:00Z"},` +
+		`{"id":8,"kind":"task.created","task_id":7,"title":"сдать отчёт","created_at":"2026-05-01T10:00:00Z"}],"next_before_id":8}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("тело = %s\nwant   %s", got, want)
+	}
+
+	// Страница неполная: курсора нет. Размер по умолчанию — 20.
+	rec = e.do("GET", "/api/v1/notifications", token, "")
+	if e.notes.limit != notification.DefaultLimit || e.notes.beforeID != 0 || strings.Contains(rec.Body.String(), "next_before_id") {
+		t.Errorf("limit %d, before_id %d, тело: %s", e.notes.limit, e.notes.beforeID, rec.Body)
+	}
+
+	// Уведомлений нет: пустой массив, а не null.
+	e.notes.items = nil
+	if rec := e.do("GET", "/api/v1/notifications", token, ""); strings.TrimSpace(rec.Body.String()) != `{"items":[]}` {
+		t.Errorf("тело без уведомлений = %s", rec.Body)
+	}
+}
+
+func TestListNotificationsErrors(t *testing.T) {
+	e := newEnv(t)
+	token := e.login("ann@example.com").AccessToken
+
+	wantError(t, e.do("GET", "/api/v1/notifications", "", ""), 401, "unauthenticated")
+	for query, field := range map[string]string{
+		"limit=0": "limit", "limit=101": "limit", "limit=abc": "limit", "before_id=-1": "before_id", "before_id=abc": "before_id",
+	} {
+		wantError(t, e.do("GET", "/api/v1/notifications?"+query, token, ""), 400, "invalid_argument", field)
+	}
+
+	// Соседний сервис не отвечает: 503 с подсказкой, когда повторить. Это не 500 — сам сервис исправен.
+	e.notes.err = fmt.Errorf("%w: connection refused", notification.ErrUnavailable)
+	rec := e.do("GET", "/api/v1/notifications", token, "")
+	wantError(t, rec, 503, "notifications_unavailable")
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("в ответе 503 нет заголовка Retry-After")
+	}
+	if strings.Contains(rec.Body.String(), "connection refused") {
+		t.Errorf("подробности сбоя ушли клиенту: %s", rec.Body)
+	}
+
+	// Любая другая ошибка соседа — 500 без подробностей.
+	e.notes.err = errors.New("rpc error: code = Internal")
+	rec = e.do("GET", "/api/v1/notifications", token, "")
+	wantError(t, rec, 500, "internal")
+	if strings.Contains(rec.Body.String(), "rpc error") {
+		t.Errorf("подробности сбоя ушли клиенту: %s", rec.Body)
+	}
+}
+
+// ---------- метрики ----------
+
+func TestMetrics(t *testing.T) {
+	e := newEnv(t)
+	token := e.login("ann@example.com").AccessToken
+	e.do("POST", "/api/v1/tasks", token, `{"title":"a"}`)
+	e.do("GET", "/api/v1/tasks/1", token, "")
+	e.do("GET", "/api/v1/tasks/999", token, "")
+	e.do("GET", "/wp-admin/setup.php", "", "")
+	e.do("GET", "/.env", "", "")
+
+	for key, want := range map[string]int{
+		"POST /api/v1/tasks 201": 1,
+		// В метку попадает шаблон маршрута: у задач 1 и 999 он один.
+		"GET /api/v1/tasks/:id 200": 1,
+		"GET /api/v1/tasks/:id 404": 1,
+		// Несуществующие пути сведены к одному значению, сколько бы их ни перебрал сканер.
+		"GET unmatched 404": 2,
+	} {
+		if e.seen.n[key] != want {
+			t.Errorf("метрика %q = %d, want %d; все: %v", key, e.seen.n[key], want, e.seen.n)
+		}
 	}
 }

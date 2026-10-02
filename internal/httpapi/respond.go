@@ -8,6 +8,7 @@ import (
 	"github.com/go-playground/validator/v10"
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/notification"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/service"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/user"
@@ -56,6 +57,11 @@ func (a *API) failErr(c *gin.Context, err error) {
 		fail(c, http.StatusBadRequest, "invalid_argument", "password must be 8 to 72 bytes long", fieldError{"password", "min"})
 	case errors.Is(err, service.ErrInvalidCredentials):
 		fail(c, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+	case errors.Is(err, notification.ErrUnavailable):
+		// Соседний сервис не отвечает. Это не ошибка клиента и не поломка этого сервиса: остальное API работает.
+		a.deps.Log.WarnContext(c.Request.Context(), "notifier is unavailable", "err", err)
+		c.Header("Retry-After", "5")
+		fail(c, http.StatusServiceUnavailable, "notifications_unavailable", "notifications are temporarily unavailable")
 	case errors.Is(err, service.ErrInvalidToken):
 		fail(c, http.StatusUnauthorized, "invalid_token", "invalid or expired token")
 	default:

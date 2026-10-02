@@ -43,6 +43,22 @@ REFRESH="$(jq -r .refresh_token <<<"$TOKENS")"
 TASK="$(expect 201 "создание задачи" "$(call POST /api/v1/tasks '{"title":"проверка сервиса"}' "$ACCESS")")"
 ID="$(jq -r .id <<<"$TASK")"
 
+# Уведомление проходит всю цепочку: outbox → Kafka → notifier → gRPC → этот запрос.
+# Она асинхронная, поэтому ждём: событие публикуется раз в секунду, читатель Kafka входит в группу несколько секунд.
+for attempt in $(seq 1 60); do
+  FEED="$(call GET /api/v1/notifications "" "$ACCESS")"
+  if [ "$(tail -n1 <<<"$FEED")" = 200 ] && [ "$(sed '$d' <<<"$FEED" | jq --argjson id "$ID" '[.items[] | select(.kind == "task.created" and .task_id == $id)] | length')" = 1 ]; then
+    echo "ok  уведомление о новой задаче дошло через Kafka (попытка $attempt)" >&2
+    break
+  fi
+  if [ "$attempt" = 60 ]; then
+    echo "ОШИБКА: уведомление не появилось за 60 секунд, последний ответ:" >&2
+    echo "$FEED" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
 expect 200 "чтение задачи" "$(call GET "/api/v1/tasks/$ID" "" "$ACCESS")" >/dev/null
 expect 200 "чтение задачи из кэша" "$(call GET "/api/v1/tasks/$ID" "" "$ACCESS")" >/dev/null
 expect 200 "изменение задачи" "$(call PATCH "/api/v1/tasks/$ID" '{"done":true}' "$ACCESS")" >/dev/null

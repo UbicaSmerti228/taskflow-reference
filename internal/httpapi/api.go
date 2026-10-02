@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 
+	"github.com/UbicaSmerti228/taskflow-reference/internal/notification"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/service"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/user"
@@ -38,6 +39,16 @@ type AuthService interface {
 	VerifyAccess(token string) (int64, error)
 }
 
+// NotificationService — что хендлерам нужно от сервиса уведомлений. За ним стоит другой сервис.
+type NotificationService interface {
+	List(ctx context.Context, userID int64, limit int, beforeID int64) ([]notification.Notification, error)
+}
+
+// Metrics получает итог каждого запроса. Реализация — в пакете metrics.
+type Metrics interface {
+	Request(method, route string, status int, took time.Duration)
+}
+
 // Limiter ограничивает частоту запросов по ключу.
 type Limiter interface {
 	Allow(ctx context.Context, key string, limit int, window time.Duration) (bool, error)
@@ -50,8 +61,10 @@ type Check func(ctx context.Context) error
 type Deps struct {
 	Tasks          TaskService
 	Auth           AuthService
+	Notifications  NotificationService
 	Limiter        Limiter
 	Log            *slog.Logger
+	Metrics        Metrics          // может быть nil
 	Ready          map[string]Check // проверки для /readyz: имя зависимости → проверка
 	LoginLimit     int              // попыток входа и регистрации в минуту с одного IP
 	TrustedProxies []string
@@ -92,7 +105,7 @@ func New(deps Deps) (*API, error) {
 
 	r.Use(
 		a.requestID, // 1. у запроса появляется id — он попадёт во все логи ниже
-		a.accessLog, // 2. лог пишется после ответа и видит итоговый статус, в том числе 500 от recover
+		a.observe,   // 2. лог и метрики пишутся после ответа и видят итоговый статус, в том числе 500 от recover
 		a.recover,   // 3. паника в хендлере превращается в 500, сервис продолжает работать
 		a.limitBody, // 4. тело больше 1 МБ не читается
 	)
@@ -116,6 +129,8 @@ func New(deps Deps) (*API, error) {
 	tasks.GET("/:id", a.getTask)
 	tasks.PATCH("/:id", a.updateTask)
 	tasks.DELETE("/:id", a.deleteTask)
+
+	v1.GET("/notifications", a.requireUser, a.listNotifications)
 
 	a.Handler = r
 	return a, nil

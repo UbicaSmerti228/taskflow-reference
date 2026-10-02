@@ -1,0 +1,58 @@
+// Контракт сервиса уведомлений. Из этого файла генерируется код сервера и клиента: make proto.
+//
+// Правила изменения: поля и значения enum можно добавлять, номера существующих менять нельзя,
+// удалённые номера помечаются reserved. Тогда старые клиенты продолжают работать с новым сервером.
+syntax = "proto3";
+
+package taskflow.notifier.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/UbicaSmerti228/taskflow-reference/internal/gen/notifierv1;notifierv1";
+
+// NotifierService хранит уведомления пользователей и отдаёт их другим сервисам.
+service NotifierService {
+  // ListNotifications возвращает уведомления пользователя, сначала новые.
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  // WatchNotifications присылает уведомления пользователя по мере появления.
+  // Стрим живёт, пока клиент его не закроет или не истечёт его deadline.
+  rpc WatchNotifications(WatchNotificationsRequest) returns (stream WatchNotificationsResponse);
+}
+
+// Kind — о чём уведомление.
+enum Kind {
+  KIND_UNSPECIFIED = 0;
+  KIND_TASK_CREATED = 1;
+  KIND_TASK_DUE = 2;
+}
+
+// Notification — одно уведомление.
+message Notification {
+  int64 id = 1;
+  int64 user_id = 2;
+  Kind kind = 3;
+  int64 task_id = 4;
+  // title — заголовок задачи на момент события.
+  string title = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message ListNotificationsRequest {
+  int64 user_id = 1;
+  // limit — сколько уведомлений вернуть: от 1 до 100, по умолчанию 20.
+  int32 limit = 2;
+  // before_id — вернуть уведомления старше этого id: так листают дальше. 0 — с самых новых.
+  int64 before_id = 3;
+}
+
+message ListNotificationsResponse {
+  repeated Notification notifications = 1;
+}
+
+message WatchNotificationsRequest {
+  int64 user_id = 1;
+}
+
+message WatchNotificationsResponse {
+  Notification notification = 1;
+}

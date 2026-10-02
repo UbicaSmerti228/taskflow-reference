@@ -8,7 +8,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     services:
-      # База для тестов, которые запускают сервис целиком командой serve.
+      # База для тестов, которые запускают сервисы целиком командой serve.
       postgres:
         image: postgres:18-alpine
         env:
@@ -20,43 +20,130 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U taskflow" --health-interval 2s --health-timeout 3s --health-retries 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go vet ./...
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
-      # Без -short: тесты репозитория сами поднимают PostgreSQL через testcontainers.
+
+      # Контракт gRPC: стиль .proto и то, что код в репозитории сгенерирован из текущего контракта.
+      - uses: bufbuild/buf-action@v1
+        with:
+          version: 1.73.0
+          setup_only: true
+      - run: buf lint
+      - run: buf format --diff --exit-code
+      - name: Сгенерированный код соответствует .proto
+        run: |
+          make proto-tools
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          buf generate
+          git diff --exit-code -- internal/gen
+      - name: Дашборд Grafana соответствует генератору
+        run: |
+          python3 scripts/gen-dashboard.py
+          git diff --exit-code -- deploy/grafana/dashboards
+
+      # Без -short: тесты хранилищ сами поднимают PostgreSQL через testcontainers. Kafka в тестах — kfake, внутри процесса.
       - run: go test -race ./...
       # Бенчмарки запускаются по одному разу: проверяем, что они работают, а не скорость — на общих машинах CI она шумит.
       - run: go test -bench=. -benchtime=1x -run='^$' ./internal/service ./internal/httpapi
-      - name: Сервис целиком на настоящей базе
+      - name: Сервисы целиком на настоящей базе
         env:
           TASKFLOW_TEST_DSN: postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable
-        run: go test -race -count=1 ./cmd/...
+        # -p 1: пакеты идут по очереди, потому что работают с одной базой.
+        run: go test -race -count=1 -p 1 ./cmd/...
 
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cp .env.example .env
       - name: Сборка и запуск
-        run: docker compose up -d --build --wait --wait-timeout 180
-      - name: Размер образа меньше 30 МБ
+        run: docker compose up -d --build --wait --wait-timeout 300
+      - name: Размер образов
         run: |
-          size=$(docker image inspect "$(docker compose images -q api)" --format '{{.Size}}')
-          echo "Размер образа: $((size / 1024 / 1024)) МБ"
-          test "$size" -lt $((30 * 1024 * 1024))
-      - name: Главный путь пользователя
+          # Образ TaskFlow вырос с 27 до 36 МБ: добавились gRPC, клиент Kafka и Prometheus. Порог не даёт ему расти незаметно.
+          for svc in api notifier; do
+            size=$(docker image inspect "$(docker compose images -q "$svc")" --format '{{.Size}}')
+            echo "$svc: $((size / 1024 / 1024)) МБ"
+            test "$size" -lt $((45 * 1024 * 1024))
+          done
+      - name: Главный путь пользователя, включая уведомление через Kafka
         run: scripts/smoke.sh http://localhost:8080
+      - name: Метрики собираются, дашборд не пустой
+        run: scripts/check-observability.sh
+      - name: Метрики и pprof доступны только во внутренней сети
+        run: |
+          set -eux
+          # closed АДРЕС — проверка, что по адресу никто не отвечает.
+          # Запись «! curl …» здесь не годится: set -e не останавливает сценарий на командах с отрицанием.
+          closed() { if curl -s -m 3 -o /dev/null "$1"; then echo "ОШИБКА: $1 отвечает, а не должен"; return 1; fi; }
+          # Служебные порты не опубликованы: с хоста до них не достучаться…
+          closed http://localhost:8081/metrics
+          closed http://localhost:9001/debug/pprof/
+          # …на публичном порту этих путей нет…
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/debug/pprof/)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/metrics)" = 404
+          # …а из сети compose они отвечают. Проверяем из контейнера Prometheus: в нём есть wget.
+          docker compose exec -T prometheus wget -q -O /dev/null http://api:8081/debug/pprof/heap
+          docker compose exec -T prometheus wget -q -O /dev/null http://notifier:9001/debug/pprof/heap
+      - name: Kafka лежит — задачи создаются, события ждут; Kafka поднялась — события ушли
+        run: |
+          set -eux
+          pending() { docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM outbox WHERE published_at IS NULL'; }
+          test "$(pending)" = 0
+          docker compose stop kafka
+
+          creds='{"email":"outage@example.com","password":"correct horse"}'
+          curl -fsS -X POST -d "$creds" localhost:8080/api/v1/auth/register >/dev/null
+          token=$(curl -fsS -X POST -d "$creds" localhost:8080/api/v1/auth/login | jq -r .access_token)
+          id=$(curl -fsS -X POST -H "Authorization: Bearer $token" -d '{"title":"создана без Kafka"}' localhost:8080/api/v1/tasks | jq -r .id)
+          test "$(pending)" = 1
+          # Готовность от Kafka не зависит.
+          curl -fsS localhost:8080/readyz
+
+          docker compose start kafka
+          for i in $(seq 1 90); do
+            n=$(curl -sS -H "Authorization: Bearer $token" localhost:8080/api/v1/notifications | jq --argjson id "$id" '[.items[]? | select(.task_id == $id)] | length' || true)
+            [ "$n" = 1 ] && break
+            sleep 1
+          done
+          test "$n" = 1
+          test "$(pending)" = 0
+      - name: Повторная доставка не создаёт второе уведомление
+        run: |
+          set -eux
+          # Возвращаем события в очередь: отправятся ещё раз, как после сбоя между публикацией и отметкой.
+          duplicates() { curl -fsS --get localhost:9090/api/v1/query --data-urlencode 'query=sum(notifier_events_total{result="duplicate"})' | jq -r '.data.result[0].value[1] // "0"'; }
+          before=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM notifier.notifications')
+          events=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM outbox')
+          dup_before=$(duplicates)
+          docker compose exec -T postgres psql -U taskflow -d taskflow -c 'UPDATE outbox SET published_at = NULL'
+          for i in $(seq 1 60); do
+            left=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM outbox WHERE published_at IS NULL')
+            [ "$left" = 0 ] && break
+            sleep 1
+          done
+          test "$left" = 0
+          # Ждём, пока notifier прочитает повторы: счётчик дубликатов вырастет на число событий.
+          for i in $(seq 1 60); do
+            dup=$(duplicates)
+            [ "$((dup - dup_before))" -ge "$events" ] && break
+            sleep 1
+          done
+          test "$((dup - dup_before))" -ge "$events"
+          after=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM notifier.notifications')
+          test "$before" = "$after"
       - name: Данные переживают пересоздание контейнеров
         run: |
           set -eux
           before=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM users')
           docker compose down
-          docker compose up -d --wait --wait-timeout 180
+          docker compose up -d --wait --wait-timeout 300
           after=$(docker compose exec -T postgres psql -U taskflow -d taskflow -tAc 'SELECT count(*) FROM users')
           test "$before" -ge 1 && test "$before" = "$after"
       - name: Без Redis сервис не готов, но жив
@@ -67,34 +154,56 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/healthz)" = 200
           docker compose start redis
           curl -fsS --retry 20 --retry-delay 1 --retry-all-errors localhost:8080/readyz
+      - name: Без notifier уведомления отвечают 503, остальное работает
+        run: |
+          set -eux
+          creds='{"email":"neighbour@example.com","password":"correct horse"}'
+          curl -fsS -X POST -d "$creds" localhost:8080/api/v1/auth/register >/dev/null
+          token=$(curl -fsS -X POST -d "$creds" localhost:8080/api/v1/auth/login | jq -r .access_token)
+          docker compose stop notifier
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" localhost:8080/api/v1/notifications)" = 503
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" localhost:8080/api/v1/tasks)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/readyz)" = 200
+          docker compose start notifier
       - name: Остановка по SIGTERM без ошибок
         run: |
           set -eux
-          docker compose stop -t 20 api
+          docker compose stop -t 20 api notifier
           test "$(docker inspect "$(docker compose ps -aq api)" --format '{{.State.ExitCode}}')" = 0
+          test "$(docker inspect "$(docker compose ps -aq notifier)" --format '{{.State.ExitCode}}')" = 0
           docker compose logs api | grep -q '"msg":"server stopped"'
+          docker compose logs notifier | grep -q '"msg":"grpc server stopped"'
       - name: Логи при ошибке
         if: failure()
-        run: docker compose logs
+        run: docker compose logs --tail 200
       - run: docker compose down -v
 
-      # Боевая схема: тот же образ за Caddy с HTTPS. Домен localhost — Caddy сам выпускает сертификат.
+      # Боевая схема: те же образы за Caddy с HTTPS. Домен localhost — Caddy сам выпускает сертификат.
       - name: Запуск за Caddy с HTTPS
         run: |
           set -eux
-          docker build -t ghcr.io/ubicasmerti228/taskflow-reference:latest . # слои уже в кэше, сборка мгновенная
-          docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 180
+          # Слои уже в кэше, сборка мгновенная.
+          docker build -t ghcr.io/ubicasmerti228/taskflow-reference:latest .
+          docker build -t ghcr.io/ubicasmerti228/taskflow-reference/notifier:latest --target notifier .
+          docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 300
           CURL_OPTS=-k scripts/smoke.sh https://localhost
-          # http перенаправляет на https, порт api наружу закрыт.
+          # http перенаправляет на https; порты сервисов, Kafka и Prometheus наружу закрыты.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/healthz)" = 308
-          ! curl -s -m 3 -o /dev/null http://localhost:8080/healthz
+          closed() { if curl -s -m 3 -o /dev/null "$1"; then echo "ОШИБКА: $1 отвечает, а не должен"; return 1; fi; }
+          for port in 8080 8081 9000 9001 9090 9092; do
+            closed "http://localhost:$port/"
+          done
+          # Grafana слушает только localhost сервера и не пускает без входа.
+          curl -fsS --retry 30 --retry-delay 2 --retry-all-errors -o /dev/null http://localhost:3000/api/health
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/dashboards/uid/taskflow)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u admin:change-me http://localhost:3000/api/dashboards/uid/taskflow)" = 200
       - name: Логи при ошибке
         if: failure()
-        run: docker compose --env-file .env -f deploy/compose.prod.yaml logs
+        run: docker compose --env-file .env -f deploy/compose.prod.yaml logs --tail 200
       - if: always()
         run: docker compose --env-file .env -f deploy/compose.prod.yaml down -v
 
-  # Публикация образа: только из main и только после зелёных проверок.
+  # Публикация образов: только из main и только после зелёных проверок.
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, docker]
@@ -103,13 +212,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -117,6 +226,14 @@ jobs:
           tags: |
             ghcr.io/ubicasmerti228/taskflow-reference:${{ github.sha }}
             ghcr.io/ubicasmerti228/taskflow-reference:latest
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: notifier
+          push: true
+          tags: |
+            ghcr.io/ubicasmerti228/taskflow-reference/notifier:${{ github.sha }}
+            ghcr.io/ubicasmerti228/taskflow-reference/notifier:latest
 
   # Выкатка на сервер. Включается, когда в настройках репозитория задана переменная DEPLOY_HOST
   # и секреты DEPLOY_USER и DEPLOY_SSH_KEY. На сервере в ~/taskflow лежат .env и папка deploy.
@@ -134,5 +251,5 @@ jobs:
             set -eu
             cd ~/taskflow
             export TAG=${{ github.sha }}
-            docker compose --env-file .env -f deploy/compose.prod.yaml pull api
-            docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 120
+            docker compose --env-file .env -f deploy/compose.prod.yaml pull api notifier
+            docker compose --env-file .env -f deploy/compose.prod.yaml up -d --wait --wait-timeout 300

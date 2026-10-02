@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/UbicaSmerti228/taskflow-reference/internal/notification"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
 
@@ -238,6 +239,51 @@ func (a *API) deleteTask(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// ---------- уведомления ----------
+
+type notificationsResponse struct {
+	Items []notification.Notification `json:"items"`
+	// NextBeforeID — курсор следующей страницы: передай его в before_id. Его нет, если страница неполная.
+	NextBeforeID int64 `json:"next_before_id,omitempty"`
+}
+
+// listNotifications отдаёт уведомления пользователя. Их хранит сервис notifier: хендлер идёт к нему по gRPC.
+func (a *API) listNotifications(c *gin.Context) {
+	limit := notification.DefaultLimit
+	if v := c.Query("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > notification.MaxLimit {
+			fail(c, http.StatusBadRequest, "invalid_argument", fmt.Sprintf("limit must be a number from 1 to %d", notification.MaxLimit), fieldError{"limit", "range"})
+			return
+		}
+		limit = n
+	}
+	var beforeID int64
+	if v := c.Query("before_id"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			fail(c, http.StatusBadRequest, "invalid_argument", "before_id must be a non-negative number", fieldError{"before_id", "min"})
+			return
+		}
+		beforeID = n
+	}
+
+	// Пользователь берётся из токена, а не из запроса: чужие уведомления запросить нельзя.
+	items, err := a.deps.Notifications.List(c.Request.Context(), userID(c), limit, beforeID)
+	if err != nil {
+		a.failErr(c, err)
+		return
+	}
+	resp := notificationsResponse{Items: items}
+	if resp.Items == nil {
+		resp.Items = []notification.Notification{} // в JSON — пустой массив, а не null
+	}
+	if len(items) == limit {
+		resp.NextBeforeID = items[len(items)-1].ID
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func pathID(c *gin.Context) (int64, bool) {

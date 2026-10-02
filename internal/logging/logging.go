@@ -7,6 +7,10 @@ import (
 	"log/slog"
 )
 
+// MetadataRequestID — ключ метаданных gRPC, в котором id запроса едет в соседний сервис.
+// По нему записи в логах двух сервисов связываются в одну цепочку.
+const MetadataRequestID = "x-request-id"
+
 type ctxKey struct{}
 
 // WithRequestID кладёт идентификатор запроса в контекст.

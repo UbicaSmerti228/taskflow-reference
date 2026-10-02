@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/storetest"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
@@ -19,8 +17,7 @@ import (
 // Один PostgreSQL на весь пакет: старт контейнера занимает секунды, тестов много.
 var testPool *pgxpool.Pool
 
-// TestMain поднимает PostgreSQL в контейнере и накатывает миграции.
-// Если задан TASKFLOW_TEST_DSN, тесты идут в уже запущенную базу — так их можно гонять без Docker.
+// TestMain поднимает PostgreSQL (см. storetest.StartPostgres) и накатывает миграции.
 // С флагом -short интеграционные тесты пропускаются.
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -31,28 +28,12 @@ func runTests(m *testing.M) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	dsn := os.Getenv("TASKFLOW_TEST_DSN")
-	if dsn == "" {
-		if !testing.Short() {
-			ctr, err := tcpostgres.Run(ctx, "postgres:18-alpine",
-				tcpostgres.WithDatabase("taskflow"),
-				tcpostgres.WithUsername("taskflow"),
-				tcpostgres.WithPassword("taskflow"),
-				tcpostgres.BasicWaitStrategies(),
-			)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "start postgres container:", err)
-				return 1
-			}
-			defer testcontainers.TerminateContainer(ctr) //nolint:errcheck // тесты уже завершились
-
-			dsn, err = ctr.ConnectionString(ctx, "sslmode=disable")
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "container address:", err)
-				return 1
-			}
-		}
+	dsn, stop, err := storetest.StartPostgres(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
+	defer stop()
 
 	if dsn != "" {
 		if err := Migrate(ctx, dsn); err != nil {
@@ -76,7 +57,7 @@ func reset(t *testing.T) {
 	if testPool == nil {
 		t.Skip("интеграционный тест: запусти без -short (нужен Docker) или задай TASKFLOW_TEST_DSN")
 	}
-	if _, err := testPool.Exec(context.Background(), `TRUNCATE users, tasks RESTART IDENTITY`); err != nil {
+	if _, err := testPool.Exec(context.Background(), `TRUNCATE users, tasks, outbox RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -95,6 +76,30 @@ func TestTasks(t *testing.T) {
 		}
 		return NewTasks(testPool), alice.ID, bob.ID
 	})
+}
+
+func TestOutbox(t *testing.T) {
+	storetest.RunOutboxSuite(t, func(t *testing.T) (storetest.TaskStore, storetest.Outbox, int64) {
+		reset(t)
+		alice, err := NewUsers(testPool).Create(context.Background(), "alice@example.com", "hash")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewTasks(testPool), NewOutbox(testPool), alice.ID
+	})
+}
+
+// Событие и задача пишутся в одной транзакции: не создалась задача — нет и события.
+func TestOutboxIsTransactional(t *testing.T) {
+	reset(t)
+	ctx := context.Background()
+	// Пользователя 999 нет: вставка задачи нарушает внешний ключ.
+	if _, err := NewTasks(testPool).Create(ctx, 999, task.NewTask{Title: "задача"}); err == nil {
+		t.Fatal("Create() для несуществующего пользователя вернул nil")
+	}
+	if n, err := NewOutbox(testPool).Pending(ctx); err != nil || n != 0 {
+		t.Errorf("Pending() = %d, %v; want 0", n, err)
+	}
 }
 
 func TestUsers(t *testing.T) {

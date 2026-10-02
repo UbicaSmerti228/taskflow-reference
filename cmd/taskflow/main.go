@@ -11,14 +11,21 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
+	"github.com/UbicaSmerti228/taskflow-reference/internal/admin"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/config"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/event"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/httpapi"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/instrument"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/kafka"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/metrics"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/notifierclient"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/outbox"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/postgres"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/redisstore"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/reminder"
@@ -49,7 +56,12 @@ const usage = `Использование:
   SLOW_QUERY       запрос к базе дольше этого попадает в лог как медленный, по умолчанию 200ms
   WEBHOOK_URL      куда отправлять напоминания; без неё они пишутся в лог
   WEBHOOK_SECRET   ключ подписи тела вебхука (заголовок X-Taskflow-Signature)
-  WEBHOOK_TIMEOUT  время на одну попытку отправки вебхука, по умолчанию 3s`
+  WEBHOOK_TIMEOUT  время на одну попытку отправки вебхука, по умолчанию 3s
+  KAFKA_BROKERS    адреса брокеров Kafka через запятую, обязательна
+  OUTBOX_INTERVAL  как часто переносить события из outbox в Kafka, по умолчанию 1s
+  NOTIFIER_ADDR    адрес gRPC-сервера notifier, обязательна
+  NOTIFIER_TIMEOUT сколько ждать ответа notifier, по умолчанию 2s
+  ADMIN_ADDR       адрес служебного сервера с /metrics и /debug/pprof, по умолчанию :8081`
 
 func main() {
 	// SIGINT и SIGTERM отменяют контекст: сервер успевает завершить текущие запросы.
@@ -94,8 +106,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	}
 }
 
-// serve подключается к базе и Redis и запускает сервис. Это место, где собираются все зависимости:
-// связи между слоями видны целиком, а сами слои знают только про интерфейсы.
+// serve подключается к базе, Redis, Kafka и notifier и запускает сервис. Это место, где собираются
+// все зависимости: связи между слоями видны целиком, а сами слои знают только про интерфейсы.
 func serve(ctx context.Context, cfg config.Config, out io.Writer) error {
 	log := logging.New(out, cfg.LogLevel)
 
@@ -115,12 +127,31 @@ func serve(ctx context.Context, cfg config.Config, out io.Writer) error {
 	}
 	defer kv.Close() //nolint:errcheck // процесс завершается
 
+	// Клиенты Kafka и notifier соединяются при первом обращении. Без базы и Redis сервис не стартует,
+	// а без этих двоих — стартует: события подождут в outbox, а уведомления ответят 503.
+	producer, err := kafka.NewProducer(cfg.KafkaBrokers, event.TopicPartitions)
+	if err != nil {
+		return err
+	}
+	defer producer.Close()
+
+	notifications, err := notifierclient.New(cfg.NotifierAddr, notifierclient.WithTimeout(cfg.NotifierTimeout))
+	if err != nil {
+		return err
+	}
+	defer notifications.Close() //nolint:errcheck // процесс завершается
+
 	tasks := postgres.NewTasks(pool)
 	return runService(ctx, cfg, log, components{
-		taskRepo:  tasks,
-		userRepo:  postgres.NewUsers(pool),
-		reminders: tasks,
-		kv:        kv,
+		taskRepo:      tasks,
+		userRepo:      postgres.NewUsers(pool),
+		reminders:     tasks,
+		kv:            kv,
+		outbox:        postgres.NewOutbox(pool),
+		publisher:     producer,
+		notifications: notifications,
+		// В готовность входят только зависимости, без которых сервис не может отвечать.
+		// Kafka и notifier сюда не входят: при их падении задачи продолжают работать.
 		ready: map[string]httpapi.Check{
 			"postgres": pool.Ping,
 			"redis":    kv.Ping,
@@ -135,17 +166,22 @@ type kvStore interface {
 	httpapi.Limiter
 }
 
-// components — хранилища, на которых работает сервис. В тестах сюда попадают хранилища в памяти.
+// components — хранилища и клиенты, на которых работает сервис. В тестах сюда попадают реализации в памяти.
 type components struct {
-	taskRepo  service.TaskRepo
-	userRepo  service.UserRepo
-	reminders reminder.Store
-	kv        kvStore
-	ready     map[string]httpapi.Check
+	taskRepo      service.TaskRepo
+	userRepo      service.UserRepo
+	reminders     reminder.Store
+	kv            kvStore
+	outbox        outbox.Store
+	publisher     outbox.Publisher
+	notifications httpapi.NotificationService
+	ready         map[string]httpapi.Check
 }
 
 // runService собирает слои и работает, пока не отменён ctx.
 func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c components) error {
+	reg := metrics.NewRegistry()
+
 	auth, err := service.NewAuth(c.userRepo, c.kv, service.AuthConfig{
 		Secret:     cfg.JWTSecret,
 		AccessTTL:  cfg.AccessTTL,
@@ -154,12 +190,15 @@ func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c comp
 	if err != nil {
 		return err
 	}
+	// Хранилище задач обёрнуто декоратором: сервис получает тот же интерфейс, а в логах и метриках появляется время запросов.
+	taskRepo := instrument.Tasks(c.taskRepo, log, cfg.SlowQuery, metrics.NewRepo(reg))
 	api, err := httpapi.New(httpapi.Deps{
-		// Хранилище задач обёрнуто декоратором: сервис получает тот же интерфейс, а в логах появляется время запросов.
-		Tasks:          service.NewTasks(instrument.Tasks(c.taskRepo, log, cfg.SlowQuery), c.kv, cfg.CacheTTL, log),
+		Tasks:          service.NewTasks(taskRepo, c.kv, cfg.CacheTTL, log),
 		Auth:           auth,
+		Notifications:  c.notifications,
 		Limiter:        c.kv,
 		Log:            log,
+		Metrics:        metrics.NewHTTP(reg),
 		Ready:          c.ready,
 		LoginLimit:     cfg.LoginLimit,
 		TrustedProxies: cfg.TrustedProxies,
@@ -170,33 +209,37 @@ func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c comp
 
 	// Напоминания уходят вебхуком, если задан адрес, иначе пишутся в лог.
 	// Воркер знает только интерфейс reminder.Notifier и не замечает разницы.
+	// Событие «срок наступил» для notifier хранилище записывает само, вместе с отметкой о напоминании.
 	var notifier reminder.Notifier = reminder.LogNotifier{Log: log}
 	if cfg.WebhookURL != "" {
 		notifier = webhook.New(cfg.WebhookURL, webhook.WithSecret(cfg.WebhookSecret), webhook.WithTimeout(cfg.WebhookTimeout))
 	}
+	reminders := reminder.New(c.reminders, notifier, cfg.RemindInterval, cfg.RemindWorkers, log)
+	relay := outbox.New(c.outbox, c.publisher, log, outbox.WithInterval(cfg.OutboxInterval), outbox.WithMetrics(metrics.NewOutbox(reg)))
 
-	srv := server.New(api,
+	public := server.New(api,
 		server.WithAddr(cfg.Addr),
-		server.WithLogger(log),
+		server.WithLogger(log.With("server", "api")),
 		server.WithShutdownTimeout(cfg.ShutdownTimeout),
 		// Остановка по порядку: сначала перестаём называться готовыми, потом дообрабатываем текущие запросы.
 		server.WithShutdownHook(api.StartShutdown),
 	)
+	// Метрики и pprof слушают отдельный порт: наружу он не публикуется.
+	internal := server.New(admin.Handler(reg),
+		server.WithAddr(cfg.AdminAddr),
+		server.WithLogger(log.With("server", "admin")),
+		server.WithShutdownTimeout(cfg.ShutdownTimeout),
+		server.WithWriteTimeout(2*time.Minute), // CPU-профиль снимается 30 секунд и дольше
+	)
 
-	ctx, stop := context.WithCancel(ctx)
-	defer stop()
-
-	var bg sync.WaitGroup
-	bg.Go(func() {
-		reminder.New(c.reminders, notifier, cfg.RemindInterval, cfg.RemindWorkers, log).Run(ctx)
-	})
-
-	// Сервер работает, пока не отменён ctx или пока не упадёт сам. В обоих случаях останавливаем воркер
-	// и ждём его: соединения с базой и Redis закроются только после возврата.
-	err = srv.Run(ctx)
-	stop()
-	bg.Wait()
-	return err
+	// errgroup запускает части сервиса и связывает их судьбу: если одна завершилась с ошибкой
+	// (например, порт занят), контекст отменяется и остальные останавливаются. Wait ждёт всех.
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return public.Run(ctx) })
+	g.Go(func() error { return internal.Run(ctx) })
+	g.Go(func() error { reminders.Run(ctx); return nil })
+	g.Go(func() error { relay.Run(ctx); return nil })
+	return g.Wait()
 }
 
 // healthcheck спрашивает /readyz у сервиса на этой же машине.

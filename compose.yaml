@@ -1,11 +1,21 @@
-# Окружение для разработки: api, postgres и redis одной командой.
+# Окружение для разработки: два сервиса и всё, от чего они зависят, одной командой.
+#
+# Что доступно с твоей машины:
+#   localhost:8080   API TaskFlow
+#   localhost:9000   gRPC notifier (для grpcurl)
+#   localhost:9090   Prometheus
+#   localhost:3000   Grafana, дашборд TaskFlow открыт без входа
+# Служебные порты сервисов (8081 и 9001: метрики и pprof) наружу не опубликованы:
+# до них достаёт только Prometheus из сети compose.
 services:
   api:
-    build: .
+    build: . # последняя стадия Dockerfile
     environment:
-      # Внутри сети compose база и Redis доступны по имени сервиса.
+      # Внутри сети compose соседи доступны по имени сервиса.
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
       REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      NOTIFIER_ADDR: notifier:9000
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       WEBHOOK_URL: ${WEBHOOK_URL:-}
@@ -13,6 +23,7 @@ services:
     ports:
       - "${API_PORT:-8080}:8080"
     depends_on:
+      # Kafka и notifier здесь нет намеренно: api стартует и работает без них.
       postgres:
         condition: service_healthy # ждём, пока база начнёт принимать соединения
       redis:
@@ -20,6 +31,29 @@ services:
     healthcheck:
       # В образе нет оболочки и curl, поэтому готовность проверяет сам бинарник.
       test: ["CMD", "/taskflow", "healthcheck"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+    restart: unless-stopped
+
+  notifier:
+    build:
+      context: .
+      target: notifier
+    environment:
+      # Та же база, но своя схема: таблицы TaskFlow сервис не видит.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:9000:9000" # только с этой машины
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/notifier", "healthcheck"]
       interval: 5s
       timeout: 4s
       retries: 12
@@ -49,5 +83,60 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # Один узел Kafka в режиме KRaft: он сам и брокер, и контроллер, ZooKeeper не нужен.
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # Адрес, который брокер сообщает клиентам. По нему они и подключаются, поэтому здесь имя сервиса.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # Узел один, поэтому реплика у служебных топиков тоже одна.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Топики создают сами сервисы, с нужным числом партиций.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafkadata:/var/lib/kafka/data # сообщения переживают пересоздание контейнера
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      # Смотреть дашборды можно без входа — это удобно на своей машине. В бою так не делают.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      # Источник данных и дашборд описаны файлами: Grafana поднимается уже настроенной.
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  kafkadata:

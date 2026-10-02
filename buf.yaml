@@ -1,0 +1,7 @@
+# Настройки buf: проверка стиля .proto. Запуск: buf lint
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD

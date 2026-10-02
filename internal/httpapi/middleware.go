@@ -28,20 +28,26 @@ func (a *API) requestID(c *gin.Context) {
 	c.Next()
 }
 
-// accessLog пишет одну запись на запрос.
-func (a *API) accessLog(c *gin.Context) {
+// observe пишет одну запись в лог и одно наблюдение в метрики на запрос.
+func (a *API) observe(c *gin.Context) {
 	start := time.Now()
 	c.Next()
+	took := time.Since(start)
 
-	route := c.FullPath() // шаблон маршрута, а не путь с id: по нему удобно группировать
+	// Шаблон маршрута, а не путь с id: по нему группируются и логи, и метрики.
+	// Несуществующие пути сведены к одному значению — иначе сканер портов создал бы тысячи рядов метрик.
+	route := c.FullPath()
 	if route == "" {
 		route = "unmatched"
+	}
+	if a.deps.Metrics != nil {
+		a.deps.Metrics.Request(c.Request.Method, route, c.Writer.Status(), took)
 	}
 	attrs := []any{
 		"method", c.Request.Method,
 		"route", route,
 		"status", c.Writer.Status(),
-		"duration_ms", time.Since(start).Milliseconds(),
+		"duration_ms", took.Milliseconds(),
 		"ip", c.ClientIP(),
 	}
 	if id, ok := c.Get(userIDKey); ok {

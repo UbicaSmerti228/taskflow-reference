@@ -14,6 +14,17 @@ func TestTasks(t *testing.T) {
 	storetest.RunTaskSuite(t, func(*testing.T) (storetest.TaskStore, int64, int64) { return NewTasks(), 1, 2 })
 }
 
+func TestOutbox(t *testing.T) {
+	storetest.RunOutboxSuite(t, func(*testing.T) (storetest.TaskStore, storetest.Outbox, int64) {
+		tasks := NewTasks()
+		return tasks, tasks.Outbox(), 1
+	})
+}
+
+func TestNotifications(t *testing.T) {
+	storetest.RunNotificationSuite(t, func(*testing.T) storetest.NotificationStore { return NewNotifications() })
+}
+
 func TestUsers(t *testing.T) {
 	storetest.RunUserSuite(t, func(*testing.T) storetest.UserStore { return NewUsers() })
 }

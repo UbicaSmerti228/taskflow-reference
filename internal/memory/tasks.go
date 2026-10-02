@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/UbicaSmerti228/taskflow-reference/internal/event"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
 )
 
@@ -22,12 +23,16 @@ type Tasks struct {
 	mu     sync.Mutex
 	tasks  []ownedTask
 	lastID int64
+	outbox *Outbox
 
 	Err error // если задано, все методы возвращают эту ошибку
 }
 
 // NewTasks возвращает пустое хранилище задач.
-func NewTasks() *Tasks { return &Tasks{} }
+func NewTasks() *Tasks { return &Tasks{outbox: &Outbox{}} }
+
+// Outbox возвращает события, которые хранилище записало вместе с изменениями задач.
+func (s *Tasks) Outbox() *Outbox { return s.outbox }
 
 // Create создаёт задачу пользователя.
 func (s *Tasks) Create(_ context.Context, userID int64, in task.NewTask) (task.Task, error) {
@@ -38,6 +43,9 @@ func (s *Tasks) Create(_ context.Context, userID int64, in task.NewTask) (task.T
 	}
 	s.lastID++
 	t := task.Task{ID: s.lastID, Title: in.Title, DueAt: in.DueAt, CreatedAt: time.Now().UTC()}
+	if err := s.outbox.add(event.TaskCreated(userID, t)); err != nil {
+		return task.Task{}, err
+	}
 	s.tasks = append(s.tasks, ownedTask{Task: t, userID: userID})
 	return t, nil
 }
@@ -136,7 +144,7 @@ func (s *Tasks) DueForReminder(_ context.Context, now time.Time) ([]task.Task, e
 	return due, nil
 }
 
-// MarkReminded запоминает, что напоминание отправлено.
+// MarkReminded запоминает, что напоминание отправлено, и записывает событие «срок наступил».
 func (s *Tasks) MarkReminded(_ context.Context, id int64, at time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,6 +154,9 @@ func (s *Tasks) MarkReminded(_ context.Context, id int64, at time.Time) error {
 	for i := range s.tasks {
 		if s.tasks[i].ID == id {
 			at = at.UTC()
+			if err := s.outbox.add(event.TaskDue(s.tasks[i].userID, s.tasks[i].Task, at)); err != nil {
+				return err
+			}
 			s.tasks[i].RemindedAt = &at
 			return nil
 		}

@@ -1,0 +1,11 @@
+# Генерация Go-кода из .proto: make proto
+# Плагины ставятся командой make proto-tools; их версии закреплены в Makefile,
+# чтобы у всех получался одинаковый код.
+version: v2
+plugins:
+  - local: protoc-gen-go # сообщения
+    out: .
+    opt: module=github.com/UbicaSmerti228/taskflow-reference
+  - local: protoc-gen-go-grpc # клиент и сервер
+    out: .
+    opt: module=github.com/UbicaSmerti228/taskflow-reference

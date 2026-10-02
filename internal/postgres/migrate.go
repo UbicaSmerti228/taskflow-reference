@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // драйвер database/sql: он нужен только goose
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib" // драйвер database/sql: он нужен только goose
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 )
@@ -28,6 +29,29 @@ func Migrate(ctx context.Context, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("read migrations: %w", err)
 	}
+	return migrate(ctx, db, files)
+}
+
+// MigrateSchema накатывает миграции из files в отдельную схему. Таблицы и журнал миграций лежат в ней,
+// поэтому в одной базе могут жить несколько сервисов, каждый со своей историей миграций.
+func MigrateSchema(ctx context.Context, dsn, schema string, files fs.FS) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parse database url: %w", err)
+	}
+	// search_path задаётся для каждого соединения: и goose, и миграции работают внутри схемы.
+	cfg.RuntimeParams["search_path"] = schema
+	db := stdlib.OpenDB(*cfg)
+	defer db.Close() //nolint:errcheck // соединение больше не нужно
+
+	// Имя схемы подставляется в текст запроса, поэтому экранируется как идентификатор.
+	if _, err := db.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		return fmt.Errorf("create schema %s: %w", schema, err)
+	}
+	return migrate(ctx, db, files)
+}
+
+func migrate(ctx context.Context, db *sql.DB, files fs.FS) error {
 	locker, err := lock.NewPostgresSessionLocker()
 	if err != nil {
 		return fmt.Errorf("create migration lock: %w", err)

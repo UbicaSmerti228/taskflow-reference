@@ -1,0 +1,8 @@
+# Grafana загружает все дашборды из папки при старте.
+apiVersion: 1
+providers:
+  - name: TaskFlow
+    type: file
+    allowUiUpdates: false # дашборд меняется правкой файла в репозитории, а не кнопками в интерфейсе
+    options:
+      path: /var/lib/grafana/dashboards

@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: TaskFlow API
-  version: 0.5.0
+  version: 1.0.0
   description: |
     Трекер задач. Задачи доступны только владельцу: каждый запрос к ним требует access-токен.
     Все ошибки приходят в одном формате, см. схему Error.
@@ -10,6 +10,7 @@ servers:
 tags:
   - name: auth
   - name: tasks
+  - name: notifications
   - name: health
 paths:
   /healthz:
@@ -272,6 +273,46 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/notifications:
+    get:
+      tags: [notifications]
+      summary: Уведомления пользователя
+      description: |
+        Уведомления хранит отдельный сервис notifier: этот запрос идёт к нему по gRPC.
+        Уведомление появляется не мгновенно — событие о задаче проходит через Kafka.
+        Если notifier не отвечает, запрос возвращает 503, остальное API при этом работает.
+      operationId: listNotifications
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          description: Сколько уведомлений вернуть
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: before_id
+          in: query
+          description: Вернуть уведомления старше этого. Значение берётся из next_before_id предыдущей страницы.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: Страница уведомлений, сначала новые
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationList"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/NotificationsUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -398,6 +439,39 @@ components:
           type: integer
           format: int64
           description: Курсор следующей страницы. Отсутствует, если страница неполная.
+    Notification:
+      type: object
+      required: [id, kind, task_id, title, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum: [task.created, task.due]
+          description: task.created — задача создана, task.due — срок задачи наступил.
+        task_id:
+          type: integer
+          format: int64
+        title:
+          type: string
+          description: Заголовок задачи на момент события
+        created_at:
+          type: string
+          format: date-time
+          description: Когда произошло событие
+    NotificationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Notification"
+        next_before_id:
+          type: integer
+          format: int64
+          description: Курсор следующей страницы. Отсутствует, если страница неполная.
     Error:
       type: object
       required: [error]
@@ -481,3 +555,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NotificationsUnavailable:
+      description: Сервис уведомлений не отвечает. Запрос можно повторить позже.
+      headers:
+        Retry-After:
+          description: Через сколько секунд повторить
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: notifications_unavailable
+              message: notifications are temporarily unavailable
+              request_id: 01999f3a-7c11-7a52-9d3e-3b0f6a2c8e41

@@ -21,7 +21,7 @@ func TestTasksBehavesLikeStore(t *testing.T) {
 	storetest.RunTaskSuite(t, func(*testing.T) (storetest.TaskStore, int64, int64) {
 		inner := memory.NewTasks()
 		// Методы воркера напоминаний обёртка не трогает: они идут в хранилище напрямую.
-		return wrapped{Tasks(inner, slog.New(slog.DiscardHandler), time.Second), inner}, 1, 2
+		return wrapped{Tasks(inner, slog.New(slog.DiscardHandler), time.Second, nil), inner}, 1, 2
 	})
 }
 
@@ -54,16 +54,28 @@ func (r *brokenRepo) Get(ctx context.Context, userID, id int64) (task.Task, erro
 	return r.Tasks.Get(ctx, userID, id)
 }
 
-func TestTasksLogs(t *testing.T) {
+// recorded запоминает последний вызов метрик.
+type recorded struct {
+	op     string
+	failed bool
+	took   time.Duration
+}
+
+func (r *recorded) Call(op string, failed bool, took time.Duration) {
+	r.op, r.failed, r.took = op, failed, took
+}
+
+func TestTasksLogsAndMetrics(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		took time.Duration
-		want string
+		name       string
+		err        error
+		took       time.Duration
+		want       string
+		wantFailed bool
 	}{
 		{name: "обычный вызов", took: 5 * time.Millisecond, want: `"level":"DEBUG","msg":"repository call","op":"tasks.get","duration_ms":5`},
 		{name: "медленный вызов", took: 250 * time.Millisecond, want: `"level":"WARN","msg":"slow repository call","op":"tasks.get","duration_ms":250`},
-		{name: "сбой хранилища", err: errors.New("connection refused"), want: `"level":"ERROR","msg":"repository call failed","op":"tasks.get","duration_ms":0,"err":"connection refused"`},
+		{name: "сбой хранилища", err: errors.New("connection refused"), wantFailed: true, want: `"level":"ERROR","msg":"repository call failed","op":"tasks.get","duration_ms":0,"err":"connection refused"`},
 		{name: "не найдено — не сбой", err: task.ErrNotFound, want: `"level":"DEBUG"`},
 		{name: "отмена клиентом — не сбой", err: context.Canceled, want: `"level":"DEBUG"`},
 	}
@@ -77,7 +89,8 @@ func TestTasksLogs(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			repo := Tasks(inner, logging.New(&logs, slog.LevelDebug), 200*time.Millisecond).(*tasks)
+			m := &recorded{}
+			repo := Tasks(inner, logging.New(&logs, slog.LevelDebug), 200*time.Millisecond, m).(*tasks)
 			repo.now = func() time.Time { return now }
 
 			ctx := logging.WithRequestID(context.Background(), "req-1")
@@ -87,6 +100,9 @@ func TestTasksLogs(t *testing.T) {
 			out := logs.String()
 			if !strings.Contains(out, tt.want) {
 				t.Errorf("в логе нет %s\n%s", tt.want, out)
+			}
+			if m.op != "tasks.get" || m.failed != tt.wantFailed || m.took != tt.took {
+				t.Errorf("в метрики ушло %+v, want tasks.get, сбой: %v, время %v", *m, tt.wantFailed, tt.took)
 			}
 			// Запись связана с запросом: по request_id видно, какой запрос был медленным.
 			if !strings.Contains(out, `"request_id":"req-1"`) {
