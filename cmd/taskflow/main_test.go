@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/UbicaSmerti228/taskflow-reference/internal/httpapi"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/memory"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/webhook"
 )
 
 // cleanup очищает таблицы тестовой базы.
@@ -132,6 +134,9 @@ func startService(t *testing.T, start func(ctx context.Context, addr string, log
 			return nil
 		}
 		stopped = true
+		// HTTP-клиент теста мог открыть соединение про запас и не отправить по нему ни одного запроса.
+		// Такое соединение Shutdown считает новым и ждёт до пяти секунд, поэтому закрываем его сами.
+		http.DefaultClient.CloseIdleConnections()
 		cancel()
 		select {
 		case err := <-done:
@@ -240,6 +245,7 @@ func TestRunService(t *testing.T) {
 		cfg := config.Config{
 			Addr: addr, JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, CacheTTL: time.Minute,
 			RemindInterval: 10 * time.Millisecond, RemindWorkers: 2, LoginLimit: 100,
+			ShutdownTimeout: 5 * time.Second, SlowQuery: time.Second,
 		}
 		return runService(ctx, cfg, logging.New(out, slog.LevelDebug), components{
 			taskRepo: tasks, userRepo: memory.NewUsers(), reminders: tasks, kv: kv,
@@ -269,11 +275,76 @@ func TestRunService(t *testing.T) {
 	}
 }
 
+// С адресом вебхука напоминания уходят получателю. Пока он отвечает ошибкой, задача не отмечается
+// и попадает в следующий обход; все повторы несут один идентификатор события и верную подпись.
+func TestRunServiceWebhook(t *testing.T) {
+	const hookSecret = "секрет получателя"
+	var (
+		mu       sync.Mutex
+		ids      []string
+		badSigns int
+	)
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Header.Get(webhook.HeaderSignature) != "sha256="+webhook.Sign([]byte(hookSecret), body) {
+			badSigns++
+		}
+		ids = append(ids, r.Header.Get(webhook.HeaderEventID))
+		if len(ids) <= 3 { // первая отправка целиком неудачна: три попытки, три отказа
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer receiver.Close()
+
+	tasks := memory.NewTasks()
+	base, logs, stop := startService(t, func(ctx context.Context, addr string, out io.Writer) error {
+		cfg := config.Config{
+			Addr: addr, JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, CacheTTL: time.Minute,
+			RemindInterval: 10 * time.Millisecond, RemindWorkers: 2, LoginLimit: 100,
+			ShutdownTimeout: 5 * time.Second, SlowQuery: time.Second,
+			WebhookURL: receiver.URL, WebhookSecret: []byte(hookSecret), WebhookTimeout: time.Second,
+		}
+		return runService(ctx, cfg, logging.New(out, slog.LevelDebug), components{
+			taskRepo: tasks, userRepo: memory.NewUsers(), reminders: tasks, kv: memory.NewKV(),
+			ready: map[string]httpapi.Check{},
+		})
+	})
+
+	scenario(t, base) // ждёт, пока у задачи появится отметка о напоминании
+
+	if err := stop(); err != nil {
+		t.Errorf("остановка: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ids) != 4 {
+		t.Fatalf("получатель увидел %d запросов, want 4: три отказа и доставку", len(ids))
+	}
+	for _, id := range ids {
+		if id != ids[0] || !strings.HasPrefix(id, "task.due:1:") {
+			t.Errorf("идентификаторы событий %q: у повторов он должен совпадать", ids)
+			break
+		}
+	}
+	if badSigns != 0 {
+		t.Errorf("запросов с неверной подписью: %d", badSigns)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `"msg":"reminder was not sent"`) {
+		t.Error("в логе нет записи о неудачной отправке")
+	}
+	if strings.Contains(out, hookSecret) {
+		t.Error("в лог попал секрет вебхука")
+	}
+}
+
 func TestRunServiceErrors(t *testing.T) {
 	tasks := memory.NewTasks()
 	c := components{taskRepo: tasks, userRepo: memory.NewUsers(), reminders: tasks, kv: memory.NewKV()}
 	log := logging.New(io.Discard, slog.LevelInfo)
-	good := config.Config{Addr: "127.0.0.1:0", JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, RemindInterval: time.Second, RemindWorkers: 1}
+	good := config.Config{Addr: "127.0.0.1:0", JWTSecret: []byte(testSecret), AccessTTL: time.Minute, RefreshTTL: time.Hour, RemindInterval: time.Second, RemindWorkers: 1, ShutdownTimeout: time.Second, SlowQuery: time.Second}
 
 	short := good
 	short.JWTSecret = []byte("короткий")

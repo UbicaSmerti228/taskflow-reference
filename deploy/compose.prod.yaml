@@ -24,6 +24,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
       # Порт api наружу не опубликован, достучаться до него может только Caddy из сети compose,
       # поэтому его заголовку X-Forwarded-For можно верить.
       TRUSTED_PROXIES: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16

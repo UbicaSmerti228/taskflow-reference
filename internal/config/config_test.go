@@ -24,7 +24,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Addr != ":8080" || cfg.AccessTTL != 15*time.Minute || cfg.RefreshTTL != 720*time.Hour ||
 		cfg.CacheTTL != time.Minute || cfg.LogLevel != slog.LevelInfo || cfg.RemindInterval != 30*time.Second ||
-		cfg.RemindWorkers != 4 || cfg.LoginLimit != 10 || cfg.TrustedProxies != nil {
+		cfg.RemindWorkers != 4 || cfg.LoginLimit != 10 || cfg.TrustedProxies != nil ||
+		cfg.ShutdownTimeout != 10*time.Second || cfg.SlowQuery != 200*time.Millisecond ||
+		cfg.WebhookURL != "" || len(cfg.WebhookSecret) != 0 || cfg.WebhookTimeout != 3*time.Second {
 		t.Errorf("значения по умолчанию = %+v", cfg)
 	}
 }
@@ -34,13 +36,17 @@ func TestLoadOverrides(t *testing.T) {
 		"DATABASE_URL": "postgres://db/taskflow", "REDIS_URL": "redis://cache:6379", "JWT_SECRET": secret,
 		"ADDR": ":9000", "ACCESS_TTL": "5m", "REFRESH_TTL": "24h", "CACHE_TTL": "10s", "LOG_LEVEL": "debug",
 		"REMIND_INTERVAL": "1s", "REMIND_WORKERS": "8", "LOGIN_LIMIT": "3", "TRUSTED_PROXIES": "10.0.0.0/8, 172.16.0.1",
+		"SHUTDOWN_TIMEOUT": "25s", "SLOW_QUERY": "50ms",
+		"WEBHOOK_URL": "https://hooks.example.com/taskflow", "WEBHOOK_SECRET": "ключ", "WEBHOOK_TIMEOUT": "1s",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Addr != ":9000" || cfg.AccessTTL != 5*time.Minute || cfg.RefreshTTL != 24*time.Hour || cfg.CacheTTL != 10*time.Second ||
 		cfg.LogLevel != slog.LevelDebug || cfg.RemindInterval != time.Second || cfg.RemindWorkers != 8 || cfg.LoginLimit != 3 ||
-		len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[1] != "172.16.0.1" {
+		len(cfg.TrustedProxies) != 2 || cfg.TrustedProxies[1] != "172.16.0.1" ||
+		cfg.ShutdownTimeout != 25*time.Second || cfg.SlowQuery != 50*time.Millisecond ||
+		cfg.WebhookURL != "https://hooks.example.com/taskflow" || string(cfg.WebhookSecret) != "ключ" || cfg.WebhookTimeout != time.Second {
 		t.Errorf("переопределённые значения = %+v", cfg)
 	}
 }
@@ -64,5 +70,36 @@ func TestLoadRequiresSecret(t *testing.T) {
 	_, err := Load(env(map[string]string{"DATABASE_URL": "x", "REDIS_URL": "y"}))
 	if err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
 		t.Errorf("Load() без JWT_SECRET: error = %v, want упоминание JWT_SECRET", err)
+	}
+}
+
+func TestLoadWebhookURL(t *testing.T) {
+	base := map[string]string{"DATABASE_URL": "x", "REDIS_URL": "y", "JWT_SECRET": secret}
+	tests := []struct {
+		url string
+		ok  bool
+	}{
+		{url: "", ok: true},
+		{url: "http://notifier:9000/hook", ok: true},
+		{url: "https://hooks.example.com/t?k=1", ok: true},
+		{url: "hooks.example.com/t", ok: false},
+		{url: "ftp://hooks.example.com", ok: false},
+		{url: "https://", ok: false},
+		{url: "http://bad host/", ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			vars := map[string]string{"WEBHOOK_URL": tt.url}
+			for k, v := range base {
+				vars[k] = v
+			}
+			_, err := Load(env(vars))
+			if tt.ok && err != nil {
+				t.Errorf("Load() error = %v, want nil", err)
+			}
+			if !tt.ok && (err == nil || !strings.Contains(err.Error(), "WEBHOOK_URL")) {
+				t.Errorf("Load() error = %v, want упоминание WEBHOOK_URL", err)
+			}
+		})
 	}
 }

@@ -24,7 +24,7 @@ import (
 // env — API на настоящих сервисах и хранилищах в памяти: тесты проверяют весь путь запроса без базы и Redis.
 type env struct {
 	*API
-	t     *testing.T
+	t     testing.TB
 	tasks *memory.Tasks
 	users *memory.Users
 	kv    *memory.KV
@@ -32,7 +32,7 @@ type env struct {
 	ready map[string]Check
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t testing.TB) *env {
 	t.Helper()
 	e := &env{t: t, tasks: memory.NewTasks(), users: memory.NewUsers(), kv: memory.NewKV(), logs: &bytes.Buffer{}, ready: map[string]Check{}}
 	log := logging.New(e.logs, slog.LevelDebug)
@@ -87,7 +87,7 @@ func (e *env) login(email string) service.Tokens {
 	return decode[service.Tokens](e.t, rec)
 }
 
-func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
+func decode[T any](t testing.TB, rec *httptest.ResponseRecorder) T {
 	t.Helper()
 	var v T
 	if err := json.Unmarshal(rec.Body.Bytes(), &v); err != nil {

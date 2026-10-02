@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,11 +17,14 @@ import (
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/config"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/httpapi"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/instrument"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/logging"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/postgres"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/redisstore"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/reminder"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/server"
 	"github.com/UbicaSmerti228/taskflow-reference/internal/service"
+	"github.com/UbicaSmerti228/taskflow-reference/internal/webhook"
 )
 
 const usage = `Использование:
@@ -42,7 +44,12 @@ const usage = `Использование:
   LOGIN_LIMIT      попыток входа в минуту с одного IP, по умолчанию 10
   REMIND_INTERVAL  как часто искать просроченные задачи, по умолчанию 30s
   REMIND_WORKERS   сколько напоминаний отправлять одновременно, по умолчанию 4
-  TRUSTED_PROXIES  адреса прокси через запятую, чьему X-Forwarded-For можно верить`
+  TRUSTED_PROXIES  адреса прокси через запятую, чьему X-Forwarded-For можно верить
+  SHUTDOWN_TIMEOUT сколько ждать текущие запросы при остановке, по умолчанию 10s
+  SLOW_QUERY       запрос к базе дольше этого попадает в лог как медленный, по умолчанию 200ms
+  WEBHOOK_URL      куда отправлять напоминания; без неё они пишутся в лог
+  WEBHOOK_SECRET   ключ подписи тела вебхука (заголовок X-Taskflow-Signature)
+  WEBHOOK_TIMEOUT  время на одну попытку отправки вебхука, по умолчанию 3s`
 
 func main() {
 	// SIGINT и SIGTERM отменяют контекст: сервер успевает завершить текущие запросы.
@@ -148,7 +155,8 @@ func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c comp
 		return err
 	}
 	api, err := httpapi.New(httpapi.Deps{
-		Tasks:          service.NewTasks(c.taskRepo, c.kv, cfg.CacheTTL, log),
+		// Хранилище задач обёрнуто декоратором: сервис получает тот же интерфейс, а в логах появляется время запросов.
+		Tasks:          service.NewTasks(instrument.Tasks(c.taskRepo, log, cfg.SlowQuery), c.kv, cfg.CacheTTL, log),
 		Auth:           auth,
 		Limiter:        c.kv,
 		Log:            log,
@@ -160,47 +168,34 @@ func runService(ctx context.Context, cfg config.Config, log *slog.Logger, c comp
 		return err
 	}
 
-	ln, err := net.Listen("tcp", cfg.Addr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.Addr, err)
+	// Напоминания уходят вебхуком, если задан адрес, иначе пишутся в лог.
+	// Воркер знает только интерфейс reminder.Notifier и не замечает разницы.
+	var notifier reminder.Notifier = reminder.LogNotifier{Log: log}
+	if cfg.WebhookURL != "" {
+		notifier = webhook.New(cfg.WebhookURL, webhook.WithSecret(cfg.WebhookSecret), webhook.WithTimeout(cfg.WebhookTimeout))
 	}
+
+	srv := server.New(api,
+		server.WithAddr(cfg.Addr),
+		server.WithLogger(log),
+		server.WithShutdownTimeout(cfg.ShutdownTimeout),
+		// Остановка по порядку: сначала перестаём называться готовыми, потом дообрабатываем текущие запросы.
+		server.WithShutdownHook(api.StartShutdown),
+	)
 
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 
 	var bg sync.WaitGroup
 	bg.Go(func() {
-		reminder.New(c.reminders, reminder.LogNotifier{Log: log}, cfg.RemindInterval, cfg.RemindWorkers, log).Run(ctx)
+		reminder.New(c.reminders, notifier, cfg.RemindInterval, cfg.RemindWorkers, log).Run(ctx)
 	})
 
-	srv := &http.Server{
-		Handler:           api,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       time.Minute,
-	}
-	failed := make(chan error, 1)
-	go func() { failed <- srv.Serve(ln) }()
-	log.Info("server started", "addr", ln.Addr().String())
-
-	select {
-	case err := <-failed:
-		stop()
-		bg.Wait()
-		return err
-	case <-ctx.Done():
-	}
-
-	// Остановка по порядку: перестаём называться готовыми, дообрабатываем текущие запросы, ждём воркер.
-	// Соединения с базой и Redis закроются после возврата.
-	log.Info("shutting down")
-	api.StartShutdown()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err = srv.Shutdown(shutdownCtx)
+	// Сервер работает, пока не отменён ctx или пока не упадёт сам. В обоих случаях останавливаем воркер
+	// и ждём его: соединения с базой и Redis закроются только после возврата.
+	err = srv.Run(ctx)
+	stop()
 	bg.Wait()
-	log.Info("server stopped")
 	return err
 }
 

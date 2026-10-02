@@ -1,6 +1,6 @@
 BINARY ?= bin/taskflow
 
-.PHONY: help build run test test-short cover lint up down smoke
+.PHONY: help build run test test-short bench cover lint up down smoke
 
 help: ## показать список целей
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-11s %s\n", $$1, $$2}'
@@ -16,6 +16,9 @@ test: ## все тесты; интеграционные поднимают Post
 
 test-short: ## только быстрые тесты, без Docker
 	go test -race -short ./...
+
+bench: ## бенчмарки горячего пути; разбор результатов в docs/perf.md
+	go test -bench=. -benchmem -run='^$$' ./internal/service ./internal/httpapi
 
 up: ## поднять api, postgres и redis в Docker
 	docker compose up -d --build --wait

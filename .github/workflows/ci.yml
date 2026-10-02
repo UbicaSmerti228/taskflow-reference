@@ -30,6 +30,8 @@ jobs:
           version: latest
       # Без -short: тесты репозитория сами поднимают PostgreSQL через testcontainers.
       - run: go test -race ./...
+      # Бенчмарки запускаются по одному разу: проверяем, что они работают, а не скорость — на общих машинах CI она шумит.
+      - run: go test -bench=. -benchtime=1x -run='^$' ./internal/service ./internal/httpapi
       - name: Сервис целиком на настоящей базе
         env:
           TASKFLOW_TEST_DSN: postgres://taskflow:taskflow@localhost:5432/taskflow?sslmode=disable

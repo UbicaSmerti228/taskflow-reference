@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,12 @@ type Config struct {
 	RemindWorkers  int
 	LoginLimit     int      // попыток входа и регистрации в минуту с одного IP
 	TrustedProxies []string // адреса прокси, чьему X-Forwarded-For можно верить
+
+	ShutdownTimeout time.Duration // сколько ждать текущие запросы при остановке
+	SlowQuery       time.Duration // запрос к базе дольше этого попадает в лог с уровнем warn
+	WebhookURL      string        // куда отправлять напоминания; пусто — писать в лог
+	WebhookSecret   []byte        // ключ подписи тела вебхука; пусто — без подписи
+	WebhookTimeout  time.Duration // время на одну попытку отправки
 }
 
 // Load читает настройки через getenv (обычно os.Getenv). Ошибки собираются все сразу:
@@ -75,6 +82,12 @@ func Load(getenv func(string) string) (Config, error) {
 		RemindInterval: duration("REMIND_INTERVAL", 30*time.Second),
 		RemindWorkers:  number("REMIND_WORKERS", 4),
 		LoginLimit:     number("LOGIN_LIMIT", 10),
+
+		ShutdownTimeout: duration("SHUTDOWN_TIMEOUT", 10*time.Second),
+		SlowQuery:       duration("SLOW_QUERY", 200*time.Millisecond),
+		WebhookURL:      getenv("WEBHOOK_URL"),
+		WebhookSecret:   []byte(getenv("WEBHOOK_SECRET")),
+		WebhookTimeout:  duration("WEBHOOK_TIMEOUT", 3*time.Second),
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
@@ -85,6 +98,12 @@ func Load(getenv func(string) string) (Config, error) {
 	if v := getenv("LOG_LEVEL"); v != "" {
 		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
 			fail("LOG_LEVEL: нужно debug, info, warn или error, получено %q", v)
+		}
+	}
+	if cfg.WebhookURL != "" {
+		// Адрес проверяем при старте: опечатка не должна всплыть ночью на первом напоминании.
+		if u, err := url.Parse(cfg.WebhookURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			fail("WEBHOOK_URL: нужен адрес вида https://example.com/hook, получено %q", cfg.WebhookURL)
 		}
 	}
 	for _, p := range strings.Split(getenv("TRUSTED_PROXIES"), ",") {

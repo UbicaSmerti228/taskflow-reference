@@ -5,8 +5,8 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/UbicaSmerti228/taskflow-reference/internal/task"
@@ -42,7 +42,18 @@ func NewTasks(repo TaskRepo, cache Cache, ttl time.Duration, log *slog.Logger) *
 }
 
 // В ключе есть владелец: один пользователь не получит из кэша задачу другого.
-func taskKey(userID, id int64) string { return fmt.Sprintf("task:%d:%d", userID, id) }
+//
+// Ключ строится на каждое чтение, поэтому собран через strconv, а не fmt.Sprintf: тот упаковывает
+// аргументы в интерфейсы и разбирает строку формата. Буфер не убегает в кучу — остаётся одна аллокация
+// под саму строку. Замеры до и после: docs/perf.md.
+func taskKey(userID, id int64) string {
+	buf := make([]byte, 0, 48) // "task:" и два int64 помещаются с запасом
+	buf = append(buf, "task:"...)
+	buf = strconv.AppendInt(buf, userID, 10)
+	buf = append(buf, ':')
+	buf = strconv.AppendInt(buf, id, 10)
+	return string(buf)
+}
 
 // Create проверяет данные и создаёт задачу.
 func (s *Tasks) Create(ctx context.Context, userID int64, in task.NewTask) (task.Task, error) {
